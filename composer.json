@@ -1,0 +1,22 @@
+{
+    "name": "pgsql-mysql-migration",
+    "description": "Production-ready PostgreSQL to MariaDB migration tool",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*",
+        "ext-pdo_mysql": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Migration\\": "src/"
+        }
+    },
+    "bin": [
+        "migrate.php"
+    ],
+    "scripts": {
+        "migrate": "php migrate.php"
+    }
+}

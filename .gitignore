@@ -1,0 +1,27 @@
+# Dependencies
+/vendor/
+composer.lock
+/vendor/autoload.php
+
+# Logs and checkpoints
+*.log
+logs/
+migrations/*_checkpoint.json
+
+# Environment variables
+.env
+.env.local
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
