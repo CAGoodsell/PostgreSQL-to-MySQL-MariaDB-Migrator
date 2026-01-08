@@ -87,7 +87,7 @@ class SchemaMigrator
         return $schemaMapping;
     }
 
-    private function getTables(PDO $pdo, array $include = [], array $exclude = [], ?string $sourceSchema = null): array
+    public function getTables(PDO $pdo, array $include = [], array $exclude = [], ?string $sourceSchema = null): array
     {
         // First, try to get the current search_path to determine which schema(s) to use
         $searchPathSql = "SHOW search_path";
@@ -184,7 +184,7 @@ class SchemaMigrator
         return $tables;
     }
 
-    private function extractTableSchema(PDO $pdo, string $table, string $schema = 'public'): array
+    public function extractTableSchema(PDO $pdo, string $table, string $schema = 'public'): array
     {
         // Get columns
         $columns = $this->getColumns($pdo, $table, $schema);
@@ -352,7 +352,7 @@ class SchemaMigrator
         return array_values($foreignKeys);
     }
 
-    private function generateCreateTableStatement(string $table, array $schema): string
+    public function generateCreateTableStatement(string $table, array $schema): string
     {
         $columns = [];
         $primaryKeyColumns = $schema['primary_key']['columns'] ?? [];

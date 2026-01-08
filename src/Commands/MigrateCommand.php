@@ -10,6 +10,7 @@ use Migration\Logger\ProgressLogger;
 use Migration\Migrators\DataMigrator;
 use Migration\Migrators\SchemaMigrator;
 use Migration\Validators\DataValidator;
+use PDO;
 
 class MigrateCommand
 {
@@ -74,11 +75,83 @@ class MigrateCommand
 
             // Data migration
             if ($mode === 'full' || $mode === 'data-only') {
-                if (empty($schemaMapping) && $mode === 'data-only') {
-                    // Load schema mapping from checkpoint or require schema migration first
-                    $this->logger->warning('Schema mapping not available. Attempting to load from checkpoints...');
-                    // For data-only mode, we'd need to load schema from target database
-                    // This is a simplified implementation
+                // In data-only mode, check if tables exist and create them if missing
+                if ($mode === 'data-only' && empty($schemaMapping)) {
+                    $this->logger->info('Data-only mode: Checking if tables exist in target database...');
+                    
+                    // Get list of tables that need to be migrated
+                    $sourcePdo = $this->connectionManager->getSourceConnection();
+                    $targetPdo = $this->connectionManager->getTargetConnection();
+                    
+                    $schemaMigrator = new SchemaMigrator(
+                        $this->connectionManager,
+                        $this->typeConverter,
+                        $this->logger,
+                        $this->dryRun
+                    );
+                    
+                    // Get tables from source
+                    $tablesWithSchemas = $schemaMigrator->getTables(
+                        $sourcePdo,
+                        $this->config['migration']['tables_include'],
+                        $this->config['migration']['tables_exclude'],
+                        $this->config['source']['schema'] ?? null
+                    );
+                    
+                    // Check which tables are missing in target
+                    $missingTables = [];
+                    foreach ($tablesWithSchemas as $tableInfo) {
+                        $table = $tableInfo['table'];
+                        if (!$this->tableExists($targetPdo, $table)) {
+                            $missingTables[] = $tableInfo;
+                        }
+                    }
+                    
+                    // Create missing tables
+                    if (!empty($missingTables)) {
+                        $this->logger->info('Found ' . count($missingTables) . ' table(s) that do not exist in target database. Creating them...');
+                        
+                        // Create schema mapping for missing tables only
+                        $schemaMapping = [];
+                        foreach ($missingTables as $tableInfo) {
+                            $table = $tableInfo['table'];
+                            $schema = $tableInfo['schema'];
+                            
+                            try {
+                                $tableSchema = $schemaMigrator->extractTableSchema($sourcePdo, $table, $schema);
+                                
+                                if (empty($tableSchema['columns'])) {
+                                    $this->logger->warning("Table {$schema}.{$table} has no columns - skipping");
+                                    continue;
+                                }
+                                
+                                $createStatement = $schemaMigrator->generateCreateTableStatement($table, $tableSchema);
+                                
+                                $schemaMapping[$table] = [
+                                    'schema' => $schema,
+                                    'columns' => $tableSchema['columns'],
+                                    'indexes' => $tableSchema['indexes'],
+                                    'foreign_keys' => $tableSchema['foreign_keys'],
+                                ];
+                                
+                                if (!$this->dryRun) {
+                                    $targetPdo->exec($createStatement);
+                                    $this->logger->success("Created missing table: {$table}");
+                                } else {
+                                    $this->logger->info("DRY RUN - Would create missing table: {$table}");
+                                }
+                            } catch (\Exception $e) {
+                                $this->logger->error("Failed to create missing table {$schema}.{$table}: " . $e->getMessage());
+                                throw $e;
+                            }
+                        }
+                        
+                        if (!empty($schemaMapping)) {
+                            $this->logger->success('Created ' . count($schemaMapping) . ' missing table(s)');
+                        }
+                    } else {
+                        $this->logger->info('All tables already exist in target database');
+                    }
                 }
 
                 $dataMigrator = new DataMigrator(
@@ -180,5 +253,25 @@ class MigrateCommand
         }
 
         return $options;
+    }
+
+    /**
+     * Check if a table exists in the target database
+     */
+    private function tableExists(PDO $pdo, string $table): bool
+    {
+        try {
+            $stmt = $pdo->prepare("
+                SELECT COUNT(*) 
+                FROM information_schema.tables 
+                WHERE table_schema = DATABASE() 
+                AND table_name = ?
+            ");
+            $stmt->execute([$table]);
+            return (int) $stmt->fetchColumn() > 0;
+        } catch (\Exception $e) {
+            // If query fails, assume table doesn't exist
+            return false;
+        }
     }
 }
