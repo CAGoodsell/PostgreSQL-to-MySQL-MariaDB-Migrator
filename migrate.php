@@ -85,7 +85,19 @@ if (in_array('--help', $argv) || in_array('-h', $argv)) {
     echo "  --resume        Resume from last checkpoint\n";
     echo "  --dry-run       Test migration without making changes\n";
     echo "  --skip-indexes  Skip creating indexes (faster migration, create manually later)\n";
+    echo "  --tables TABLES  Comma-separated list of tables to migrate (only these tables will be migrated)\n";
+    echo "  --skip-tables TABLES  Comma-separated list of tables to skip during migration\n";
+    echo "  --find-missing  Find tables and rows that were not migrated\n";
+    echo "  --after-date DATE  Only migrate rows where date column is on or after DATE (requires --date-column)\n";
+    echo "  --before-date DATE Only migrate rows where date column is before DATE (requires --date-column)\n";
+    echo "  --date-column COL  Column name to use for date filtering (requires --after-date or --before-date)\n";
     echo "  --help, -h      Show this help message\n\n";
+    echo "Examples:\n";
+    echo "  php migrate.php --data-only --after-date '2024-01-01' --date-column 'created_at'\n";
+    echo "  php migrate.php --data-only --before-date '2024-12-31' --date-column 'created_at'\n";
+    echo "  php migrate.php --full --after-date '2024-01-01' --before-date '2024-12-31' --date-column 'updated_at'\n";
+    echo "  php migrate.php --full --tables 'users,orders,products'\n";
+    echo "  php migrate.php --full --skip-tables 'logs,audit_trail,temp_data'\n\n";
     echo "Environment Variables:\n";
     echo "  PG_HOST, PG_PORT, PG_DATABASE, PG_USERNAME, PG_PASSWORD\n";
     echo "  MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, MYSQL_USERNAME, MYSQL_PASSWORD\n";
@@ -114,10 +126,46 @@ foreach ($requiredTarget as $key) {
 }
 
 try {
-    $command = new MigrateCommand($config, $options['dry-run'], $options['skip-indexes']);
-    $command->execute($options['mode'], $options['resume']);
+    $command = new MigrateCommand(
+        $config, 
+        $options['dry-run'], 
+        $options['skip-indexes'],
+        $options['after-date'],
+        $options['before-date'],
+        $options['date-column'],
+        $options['skip-tables'] ?? null,
+        $options['tables'] ?? null
+    );
     
-    echo "\nMigration completed successfully!\n";
+    if ($options['find-missing']) {
+        // Merge CLI included/excluded tables with config tables
+        $tablesInclude = $config['migration']['tables_include'] ?? [];
+        if (!empty($options['tables'])) {
+            $cliIncluded = array_map('trim', explode(',', $options['tables']));
+            if (!empty($tablesInclude)) {
+                $tablesInclude = array_intersect($tablesInclude, $cliIncluded);
+            } else {
+                $tablesInclude = $cliIncluded;
+            }
+        }
+        
+        $tablesExclude = $config['migration']['tables_exclude'] ?? [];
+        if (!empty($options['skip-tables'])) {
+            $cliExcluded = array_map('trim', explode(',', $options['skip-tables']));
+            $tablesExclude = array_merge($tablesExclude, $cliExcluded);
+            $tablesExclude = array_values(array_unique(array_filter($tablesExclude)));
+        }
+        
+        $command->findMissingRows(
+            $tablesInclude,
+            $tablesExclude,
+            $config['source']['schema'] ?? null
+        );
+    } else {
+        $command->execute($options['mode'], $options['resume']);
+        echo "\nMigration completed successfully!\n";
+    }
+    
     exit(0);
 } catch (\Exception $e) {
     echo "\nError: " . $e->getMessage() . "\n";

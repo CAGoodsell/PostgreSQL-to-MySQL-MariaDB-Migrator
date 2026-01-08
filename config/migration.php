@@ -12,6 +12,17 @@ return [
         'password' => env('PG_PASSWORD', ''),
         'charset' => 'utf8',
         'schema' => env('PG_SCHEMA', null), // Specific schema to migrate from (null = all schemas)
+        'ssh' => [
+            'enabled' => (bool) env('PG_SSH_ENABLED', false),
+            'host' => env('PG_SSH_HOST', ''),
+            'port' => (int) env('PG_SSH_PORT', 22),
+            'user' => env('PG_SSH_USER', ''),
+            'key_path' => env('PG_SSH_KEY_PATH', null),
+            'password' => env('PG_SSH_PASSWORD', null),
+            'remote_host' => env('PG_SSH_REMOTE_HOST', 'localhost'), // Database host as seen from SSH server
+            'remote_port' => (int) env('PG_SSH_REMOTE_PORT', 5432), // Database port as seen from SSH server
+            'local_port' => (int) env('PG_SSH_LOCAL_PORT', 0), // Local port for tunnel (0 = auto-assign)
+        ],
     ],
 
     'target' => [
@@ -23,6 +34,17 @@ return [
         'password' => env('MYSQL_PASSWORD', ''),
         'charset' => 'utf8mb4',
         'collation' => 'utf8mb4_unicode_ci',
+        'ssh' => [
+            'enabled' => (bool) env('MYSQL_SSH_ENABLED', false),
+            'host' => env('MYSQL_SSH_HOST', ''),
+            'port' => (int) env('MYSQL_SSH_PORT', 22),
+            'user' => env('MYSQL_SSH_USER', ''),
+            'key_path' => env('MYSQL_SSH_KEY_PATH', null),
+            'password' => env('MYSQL_SSH_PASSWORD', null),
+            'remote_host' => env('MYSQL_SSH_REMOTE_HOST', 'localhost'), // Database host as seen from SSH server
+            'remote_port' => (int) env('MYSQL_SSH_REMOTE_PORT', 3306), // Database port as seen from SSH server
+            'local_port' => (int) env('MYSQL_SSH_LOCAL_PORT', 0), // Local port for tunnel (0 = auto-assign)
+        ],
     ],
 
     'migration' => [

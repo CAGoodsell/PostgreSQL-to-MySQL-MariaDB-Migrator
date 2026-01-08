@@ -95,7 +95,7 @@ class DataValidator
     private function validateSampleData(PDO $sourcePdo, PDO $targetPdo, string $table): bool
     {
         // Get column names
-        $columns = $this->getColumns($sourcePdo, $table);
+        $columns = $this->getColumnsHelper($sourcePdo, $table);
         if (empty($columns)) {
             return true;
         }
@@ -187,18 +187,323 @@ class DataValidator
         }
     }
 
-    private function getColumns(PDO $pdo, string $table): array
+    private function getColumns(PDO $pdo, string $table, ?string $sourceSchema = null): array
     {
+        return $this->getColumnsHelper($pdo, $table, $sourceSchema);
+    }
+    
+    private function getColumnsHelper(PDO $pdo, string $table, ?string $sourceSchema = null): array
+    {
+        try {
+            // Try PostgreSQL first
+            if ($sourceSchema !== null) {
+                $escapedSchema = str_replace("'", "''", $sourceSchema);
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = '{$escapedSchema}' AND table_name = '{$escapedTable}'
+                    ORDER BY ordinal_position
+                ";
+            } else {
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = '{$escapedTable}'
+                    ORDER BY ordinal_position
+                ";
+            }
+            
+            $stmt = $pdo->query($sql);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Exception $e) {
+            // Not PostgreSQL, try MySQL/MariaDB
+            $sql = "
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE() AND table_name = ?
+                ORDER BY ordinal_position
+            ";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$table]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+    }
+
+    /**
+     * Find tables and rows that were not migrated
+     * Returns detailed information about missing rows
+     */
+    public function findMissingRows(array $tablesInclude = [], array $tablesExclude = [], ?string $sourceSchema = null, int $limitPerTable = 100): array
+    {
+        $this->logger->info('Finding missing rows (rows in source but not in target)...');
+        
+        $sourcePdo = $this->connectionManager->getSourceConnection();
+        $targetPdo = $this->connectionManager->getTargetConnection();
+
+        $tables = $this->getTables($sourcePdo, $tablesInclude, $tablesExclude);
+        $results = [];
+
+        foreach ($tables as $table) {
+            $this->logger->info("Checking table: {$table}");
+            
+            try {
+                $sourceRows = $this->getRowCount($sourcePdo, $table);
+                $targetRows = $this->getRowCount($targetPdo, $table);
+                
+                if ($sourceRows === $targetRows) {
+                    $this->logger->info("Table {$table}: Row counts match, skipping detailed check");
+                    continue;
+                }
+                
+                $this->logger->warning("Table {$table}: Row count mismatch! Source: {$sourceRows}, Target: {$targetRows}");
+                
+                // Find missing rows
+                $missingRows = $this->findMissingRowsInTable($sourcePdo, $targetPdo, $table, $sourceSchema, $limitPerTable);
+                
+                $results[$table] = [
+                    'table' => $table,
+                    'source_rows' => $sourceRows,
+                    'target_rows' => $targetRows,
+                    'missing_count' => count($missingRows),
+                    'missing_rows' => $missingRows,
+                ];
+                
+                if (!empty($missingRows)) {
+                    $this->logger->error("Table {$table}: Found " . count($missingRows) . " missing row(s)");
+                }
+            } catch (\Exception $e) {
+                $this->logger->error("Failed to check table {$table}: " . $e->getMessage());
+                $results[$table] = [
+                    'table' => $table,
+                    'error' => $e->getMessage(),
+                ];
+            }
+        }
+
+        $tablesWithMissingRows = count(array_filter($results, fn($r) => !empty($r['missing_rows'] ?? [])));
+        $this->logger->info("Found missing rows in {$tablesWithMissingRows} table(s)");
+
+        return $results;
+    }
+
+    private function findMissingRowsInTable(PDO $sourcePdo, PDO $targetPdo, string $table, ?string $sourceSchema, int $limit): array
+    {
+        // Get primary key column
+        $pkColumn = $this->getPrimaryKeyColumn($sourcePdo, $table, $sourceSchema);
+        
+        if ($pkColumn === null) {
+            // No primary key, use all columns for comparison (slower but works)
+            return $this->findMissingRowsByAllColumns($sourcePdo, $targetPdo, $table, $sourceSchema, $limit);
+        }
+        
+        // Use primary key for efficient comparison
+        return $this->findMissingRowsByPrimaryKey($sourcePdo, $targetPdo, $table, $pkColumn, $sourceSchema, $limit);
+    }
+
+    private function findMissingRowsByPrimaryKey(PDO $sourcePdo, PDO $targetPdo, string $table, string $pkColumn, ?string $sourceSchema, int $limit): array
+    {
+        $quotedPk = $this->quoteIdentifier($pkColumn);
+        $quotedTable = $this->quoteIdentifier($table);
+        
+        // Build source table reference
+        if ($sourceSchema !== null) {
+            $sourceTableRef = $this->quotePostgresIdentifier($sourceSchema) . '.' . $this->quotePostgresIdentifier($table);
+        } else {
+            $sourceTableRef = $quotedTable;
+        }
+        
+        // Find rows in source that don't exist in target
         $sql = "
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = :table
-            ORDER BY ordinal_position
+            SELECT s.{$quotedPk}
+            FROM {$sourceTableRef} s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {$quotedTable} t WHERE t.{$quotedPk} = s.{$quotedPk}
+            )
+            LIMIT {$limit}
         ";
         
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute(['table' => $table]);
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        try {
+            $stmt = $sourcePdo->query($sql);
+            $missingPks = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            
+            if (empty($missingPks)) {
+                return [];
+            }
+            
+            // Get full row data for missing primary keys
+            $pkPlaceholders = implode(',', array_fill(0, count($missingPks), '?'));
+            $selectSql = "SELECT * FROM {$sourceTableRef} WHERE {$quotedPk} IN ({$pkPlaceholders})";
+            $stmt = $sourcePdo->prepare($selectSql);
+            $stmt->execute($missingPks);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Exception $e) {
+            $this->logger->warning("Could not find missing rows by primary key for {$table}: " . $e->getMessage());
+            return [];
+        }
+    }
+
+    private function findMissingRowsByAllColumns(PDO $sourcePdo, PDO $targetPdo, string $table, ?string $sourceSchema, int $limit): array
+    {
+        // This is slower but works when there's no primary key
+        $columns = $this->getColumns($sourcePdo, $table, $sourceSchema);
+        if (empty($columns)) {
+            return [];
+        }
+        
+        $columnNames = array_column($columns, 'column_name');
+        $quotedColumns = array_map([$this, 'quoteIdentifier'], $columnNames);
+        $columnsList = implode(', ', $quotedColumns);
+        
+        // Build source table reference
+        if ($sourceSchema !== null) {
+            $sourceTableRef = $this->quotePostgresIdentifier($sourceSchema) . '.' . $this->quotePostgresIdentifier($table);
+        } else {
+            $sourceTableRef = $this->quoteIdentifier($table);
+        }
+        
+        $targetTableRef = $this->quoteIdentifier($table);
+        
+        // Get sample rows from source
+        $sourceSql = "SELECT {$columnsList} FROM {$sourceTableRef} LIMIT {$limit * 2}";
+        $sourceRows = $sourcePdo->query($sourceSql)->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($sourceRows)) {
+            return [];
+        }
+        
+        // Check each source row against target
+        $missingRows = [];
+        foreach ($sourceRows as $sourceRow) {
+            $whereConditions = [];
+            $params = [];
+            
+            foreach ($columnNames as $col) {
+                $quotedCol = $this->quoteIdentifier($col);
+                if ($sourceRow[$col] === null) {
+                    $whereConditions[] = "{$quotedCol} IS NULL";
+                } else {
+                    $whereConditions[] = "{$quotedCol} = ?";
+                    $params[] = $sourceRow[$col];
+                }
+            }
+            
+            $whereClause = implode(' AND ', $whereConditions);
+            $checkSql = "SELECT COUNT(*) FROM {$targetTableRef} WHERE {$whereClause}";
+            
+            $stmt = $targetPdo->prepare($checkSql);
+            $stmt->execute($params);
+            
+            if ((int) $stmt->fetchColumn() === 0) {
+                $missingRows[] = $sourceRow;
+                if (count($missingRows) >= $limit) {
+                    break;
+                }
+            }
+        }
+        
+        return $missingRows;
+    }
+
+    private function getPrimaryKeyColumn(PDO $pdo, string $table, ?string $sourceSchema = null): ?string
+    {
+        try {
+            // Try PostgreSQL first
+            if ($sourceSchema !== null) {
+                $escapedSchema = str_replace("'", "''", $sourceSchema);
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    JOIN pg_class c ON c.oid = i.indrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE i.indisprimary = true
+                    AND n.nspname = '{$escapedSchema}'
+                    AND c.relname = '{$escapedTable}'
+                    LIMIT 1
+                ";
+            } else {
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    JOIN pg_class c ON c.oid = i.indrelid
+                    WHERE i.indisprimary = true
+                    AND c.relname = '{$escapedTable}'
+                    LIMIT 1
+                ";
+            }
+            
+            $stmt = $pdo->query($sql);
+            $pk = $stmt->fetchColumn();
+            return $pk ?: null;
+        } catch (\Exception $e) {
+            // Not PostgreSQL or query failed, try MySQL/MariaDB
+            try {
+                $sql = "
+                    SELECT column_name
+                    FROM information_schema.key_column_usage
+                    WHERE table_schema = DATABASE()
+                    AND table_name = ?
+                    AND constraint_name = 'PRIMARY'
+                    ORDER BY ordinal_position
+                    LIMIT 1
+                ";
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute([$table]);
+                $pk = $stmt->fetchColumn();
+                return $pk ?: null;
+            } catch (\Exception $e2) {
+                return null;
+            }
+        }
+    }
+
+    private function getColumns(PDO $pdo, string $table, ?string $sourceSchema = null): array
+    {
+        try {
+            // Try PostgreSQL first
+            if ($sourceSchema !== null) {
+                $escapedSchema = str_replace("'", "''", $sourceSchema);
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = '{$escapedSchema}' AND table_name = '{$escapedTable}'
+                    ORDER BY ordinal_position
+                ";
+            } else {
+                $escapedTable = str_replace("'", "''", $table);
+                $sql = "
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = '{$escapedTable}'
+                    ORDER BY ordinal_position
+                ";
+            }
+            
+            $stmt = $pdo->query($sql);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Exception $e) {
+            // Not PostgreSQL, try MySQL/MariaDB
+            $sql = "
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE() AND table_name = ?
+                ORDER BY ordinal_position
+            ";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$table]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+    }
+
+    private function quotePostgresIdentifier(string $identifier): string
+    {
+        return '"' . str_replace('"', '""', $identifier) . '"';
     }
 
     private function quoteIdentifier(string $identifier): string

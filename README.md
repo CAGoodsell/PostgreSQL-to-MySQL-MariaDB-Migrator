@@ -10,9 +10,14 @@ A production-ready migration toolkit for migrating PostgreSQL databases to Maria
 - **Resumable**: Can resume from checkpoints if interrupted
 - **Type Safety**: Comprehensive data type conversion from PostgreSQL to MariaDB
 - **Date/Time Validation**: Automatically detects and fixes corrupted dates (defaults to Unix epoch)
+- **Date Filtering**: Filter data migration by date ranges (after, before, or both)
+- **SSH Tunnel Support**: Connect to databases through SSH tunnels for secure remote access
+- **Table Filtering**: Selectively migrate specific tables or exclude tables via CLI or config
 - **Foreign Key Validation**: Pre-validates foreign keys and reports orphaned rows before creation
 - **Schema Support**: Migrate from specific PostgreSQL schemas (MySQL/MariaDB doesn't support schemas)
 - **Skip Indexes Option**: Option to skip index creation for faster migration
+- **Auto-Create Tables**: In data-only mode, automatically creates missing tables in target database
+- **Missing Row Detection**: Find and report rows that failed to migrate
 - **Validation**: Row count and sample data validation
 - **Progress Tracking**: Real-time progress logging with single-line progress bars
 - **Error Recovery**: Continues processing despite individual chunk failures
@@ -25,16 +30,14 @@ A production-ready migration toolkit for migrating PostgreSQL databases to Maria
   - `ext-pdo`
   - `ext-pdo_pgsql` (PostgreSQL)
   - `ext-pdo_mysql` (MySQL/MariaDB)
-- Composer (for dependency management)
+- SSH client (optional, for SSH tunnel support)
+  - `ssh` command must be available in PATH
+  - For password authentication: `sshpass` tool (optional, key-based auth recommended)
 
 ## Installation
 
 1. Clone or download this repository
-2. Install dependencies:
-```bash
-composer install
-```
-
+2. The project includes a custom autoloader, so no Composer installation is required
 3. Configure the migration tool by creating a `.env` file (see Configuration section below)
 
 ## Configuration
@@ -64,6 +67,32 @@ MYSQL_PORT=3306
 MYSQL_DATABASE=your_mysql_database
 MYSQL_USERNAME=your_mysql_username
 MYSQL_PASSWORD=your_mysql_password
+
+# PostgreSQL SSH Tunnel Configuration (optional)
+# Enable SSH tunneling if database is not directly accessible
+PG_SSH_ENABLED=false
+PG_SSH_HOST=ssh.example.com
+PG_SSH_PORT=22
+PG_SSH_USER=ssh_username
+PG_SSH_KEY_PATH=/path/to/private/key
+# OR use password authentication (requires sshpass)
+# PG_SSH_PASSWORD=ssh_password
+PG_SSH_REMOTE_HOST=localhost
+PG_SSH_REMOTE_PORT=5432
+PG_SSH_LOCAL_PORT=0
+
+# MySQL/MariaDB SSH Tunnel Configuration (optional)
+# Enable SSH tunneling if database is not directly accessible
+MYSQL_SSH_ENABLED=false
+MYSQL_SSH_HOST=ssh.example.com
+MYSQL_SSH_PORT=22
+MYSQL_SSH_USER=ssh_username
+MYSQL_SSH_KEY_PATH=/path/to/private/key
+# OR use password authentication (requires sshpass)
+# MYSQL_SSH_PASSWORD=ssh_password
+MYSQL_SSH_REMOTE_HOST=localhost
+MYSQL_SSH_REMOTE_PORT=3306
+MYSQL_SSH_LOCAL_PORT=0
 ```
 
 **Important:** The `.env` file is excluded from Git (via `.gitignore`) to protect your credentials. Never commit your `.env` file to version control.
@@ -87,6 +116,94 @@ You can also set the following environment variables directly (useful for CI/CD 
 - `MYSQL_USERNAME` - Username
 - `MYSQL_PASSWORD` - Password
 
+**SSH Tunnel Configuration (Optional):**
+- `PG_SSH_ENABLED` - Enable SSH tunnel for PostgreSQL (true/false, default: false)
+- `PG_SSH_HOST` - SSH server hostname or IP
+- `PG_SSH_PORT` - SSH server port (default: 22)
+- `PG_SSH_USER` - SSH username
+- `PG_SSH_KEY_PATH` - Path to SSH private key file (recommended)
+- `PG_SSH_PASSWORD` - SSH password (alternative to key, requires `sshpass` tool)
+- `PG_SSH_REMOTE_HOST` - Database host as seen from SSH server (default: localhost)
+- `PG_SSH_REMOTE_PORT` - Database port as seen from SSH server (default: 5432)
+- `PG_SSH_LOCAL_PORT` - Local port for tunnel (0 = auto-assign, default: 0)
+
+- `MYSQL_SSH_ENABLED` - Enable SSH tunnel for MySQL/MariaDB (true/false, default: false)
+- `MYSQL_SSH_HOST` - SSH server hostname or IP
+- `MYSQL_SSH_PORT` - SSH server port (default: 22)
+- `MYSQL_SSH_USER` - SSH username
+- `MYSQL_SSH_KEY_PATH` - Path to SSH private key file (recommended)
+- `MYSQL_SSH_PASSWORD` - SSH password (alternative to key, requires `sshpass` tool)
+- `MYSQL_SSH_REMOTE_HOST` - Database host as seen from SSH server (default: localhost)
+- `MYSQL_SSH_REMOTE_PORT` - Database port as seen from SSH server (default: 3306)
+- `MYSQL_SSH_LOCAL_PORT` - Local port for tunnel (0 = auto-assign, default: 0)
+
+### SSH Tunnel Configuration
+
+The migration tool supports SSH tunneling for secure database connections when databases are not directly accessible. This is useful when:
+
+- Databases are behind firewalls
+- Databases only allow connections from specific hosts
+- You need to connect through a bastion/jump server
+- You want to encrypt database traffic over an insecure network
+
+**How it works:**
+1. The tool creates an SSH tunnel from your local machine to the SSH server
+2. The SSH server forwards connections to the database server
+3. The tool connects to the database through the local tunnel port
+4. All database traffic is encrypted through the SSH tunnel
+
+**Requirements:**
+- SSH client must be installed (`ssh` command available)
+- For password authentication: `sshpass` tool must be installed (optional, key-based auth recommended)
+- SSH access to the server that can reach the database
+
+**Example Configuration:**
+
+```env
+# Enable SSH tunnel for PostgreSQL
+PG_SSH_ENABLED=true
+PG_SSH_HOST=bastion.example.com
+PG_SSH_PORT=22
+PG_SSH_USER=deploy
+PG_SSH_KEY_PATH=/home/user/.ssh/id_rsa
+PG_SSH_REMOTE_HOST=localhost
+PG_SSH_REMOTE_PORT=5432
+
+# Enable SSH tunnel for MySQL/MariaDB
+MYSQL_SSH_ENABLED=true
+MYSQL_SSH_HOST=bastion.example.com
+MYSQL_SSH_PORT=22
+MYSQL_SSH_USER=deploy
+MYSQL_SSH_KEY_PATH=/home/user/.ssh/id_rsa
+MYSQL_SSH_REMOTE_HOST=localhost
+MYSQL_SSH_REMOTE_PORT=3306
+```
+
+**Authentication Methods:**
+
+1. **SSH Key (Recommended):**
+   ```env
+   PG_SSH_KEY_PATH=/path/to/private/key
+   ```
+   - More secure
+   - No additional tools required
+   - Supports passphrase-protected keys (via SSH agent)
+
+2. **Password (Alternative):**
+   ```env
+   PG_SSH_PASSWORD=your_ssh_password
+   ```
+   - Requires `sshpass` tool to be installed
+   - Less secure than key-based auth
+   - Useful for quick testing or when keys aren't available
+
+**Important Notes:**
+- SSH tunnels are automatically created when connections are established
+- Tunnels are automatically closed when the migration completes or is interrupted
+- If a tunnel fails to establish, the migration will fail with a clear error message
+- Multiple tunnels can be active simultaneously (one for source, one for target)
+- Local ports are auto-assigned by default (starting from 33000) to avoid conflicts
+
 **Migration Settings:**
 - `MIGRATION_CHUNK_SIZE` - Default chunk size for data migration (default: 10000)
 - `MIGRATION_LARGE_CHUNK_SIZE` - Chunk size for large tables (default: 50000)
@@ -94,8 +211,20 @@ You can also set the following environment variables directly (useful for CI/CD 
 - `MIGRATION_PARALLEL_WORKERS` - Number of parallel workers (default: 4)
 - `MIGRATION_CHECKPOINT_INTERVAL` - Checkpoint frequency in chunks (default: 100)
 - `MIGRATION_SKIP_INDEXES` - Skip index creation (true/false, default: false)
+
+**Date Filtering (CLI-only options):**
+Date filtering is currently only available via CLI options (`--after-date`, `--before-date`, `--date-column`). These cannot be set via environment variables in the current version.
 - `MIGRATION_TABLES_INCLUDE` - Comma-separated list of tables to include (empty = all)
 - `MIGRATION_TABLES_EXCLUDE` - Comma-separated list of tables to exclude
+
+**Note:** You can also use CLI options to specify tables without modifying your `.env` file:
+- `--tables TABLES` - Specify which tables to migrate (merged with `MIGRATION_TABLES_INCLUDE`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+- `--skip-tables TABLES` - Specify which tables to skip (merged with `MIGRATION_TABLES_EXCLUDE`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+
+**Behavior:**
+- If both `--tables` and `MIGRATION_TABLES_INCLUDE` are specified, only tables that appear in both lists will be migrated (intersection).
+- If both `--tables` and `--skip-tables` are specified, excluded tables take precedence (tables in `--skip-tables` will not be migrated even if they're in `--tables`).
+- In `--data-only` mode, table filtering applies to both table discovery (for auto-creating missing tables) and data migration.
 
 ### Configuration File
 
@@ -137,7 +266,7 @@ php migrate.php --full
 # Schema only
 php migrate.php --schema-only
 
-# Data only (requires schema to exist)
+# Data only (requires schema to exist, will auto-create missing tables)
 php migrate.php --data-only
 
 # Resume from checkpoint
@@ -148,17 +277,124 @@ php migrate.php --dry-run --schema-only
 
 # Skip index creation (faster migration)
 php migrate.php --full --skip-indexes
+
+# Migrate only rows after a specific date
+php migrate.php --data-only --after-date '2024-01-01' --date-column 'created_at'
+
+# Migrate only rows before a specific date
+php migrate.php --data-only --before-date '2024-12-31' --date-column 'created_at'
+
+# Migrate rows within a date range
+php migrate.php --data-only --after-date '2024-01-01' --before-date '2024-12-31' --date-column 'created_at'
+
+# Migrate only specific tables
+php migrate.php --full --tables 'users,orders,products'
+
+# Migrate only specific tables in data-only mode
+php migrate.php --data-only --tables 'users,orders,products'
+
+# Skip specific tables during migration
+php migrate.php --full --skip-tables 'logs,audit_trail,temp_data'
+
+# Skip specific tables in data-only mode
+php migrate.php --data-only --skip-tables 'logs,audit_trail'
+
+# Combine table filtering with date filtering
+php migrate.php --data-only --tables 'transactions' --after-date '2024-01-01' --date-column 'created_at'
+
+# Find missing rows (rows in source but not in target)
+php migrate.php --find-missing
 ```
 
 ### Command Options
 
 - `--full` - Perform full migration (schema + data) [default]
 - `--schema-only` - Migrate schema only
-- `--data-only` - Migrate data only (requires schema to exist)
+- `--data-only` - Migrate data only (requires schema to exist, will auto-create missing tables)
 - `--resume` - Resume from last checkpoint
 - `--dry-run` - Test migration without making changes
 - `--skip-indexes` - Skip creating indexes (faster migration, create manually later)
+- `--tables TABLES` - Comma-separated list of tables to migrate (only these tables will be migrated, e.g., `'users,orders,products'`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+- `--skip-tables TABLES` - Comma-separated list of tables to skip during migration (e.g., `'logs,audit_trail'`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+- `--find-missing` - Find tables and rows that were not migrated
+- `--after-date DATE` - Only migrate rows where date column is on or after DATE (includes DATE, requires `--date-column`)
+- `--before-date DATE` - Only migrate rows where date column is before DATE (excludes DATE, requires `--date-column`)
+- `--date-column COL` - Column name to use for date filtering (requires `--after-date` or `--before-date`)
 - `--help` or `-h` - Show help message
+
+### Date Filtering
+
+The `--after-date`, `--before-date`, and `--date-column` options allow you to migrate only rows that meet date criteria. This is useful for:
+- **Incremental migrations**: Migrate only new data since a specific date (inclusive)
+- **Historical data**: Migrate only data before a specific date
+- **Date range**: Migrate data within a specific date range
+- **Selective migration**: Migrate only specific time periods
+
+**Usage:**
+```bash
+# Migrate only rows where created_at is on or after 2024-01-01 (includes 2024-01-01)
+php migrate.php --data-only --after-date '2024-01-01' --date-column 'created_at'
+
+# Migrate only rows where created_at is before 2024-12-31 (excludes 2024-12-31)
+php migrate.php --data-only --before-date '2024-12-31' --date-column 'created_at'
+
+# Migrate rows within a date range (2024-01-01 to 2024-12-31, inclusive start, exclusive end)
+php migrate.php --data-only --after-date '2024-01-01' --before-date '2024-12-31' --date-column 'created_at'
+
+# With full timestamp
+php migrate.php --full --after-date '2024-01-01 00:00:00' --date-column 'updated_at'
+```
+
+**Important Notes:**
+- `--date-column` is required when using `--after-date` or `--before-date`
+- You can use `--after-date` alone, `--before-date` alone, or both together for a date range
+- `--after-date` uses `>=` (greater than or equal), so the specified date is **included**
+- `--before-date` uses `<` (less than), so the specified date is **excluded**
+- When using both filters together: `date_column >= after_date AND date_column < before_date`
+- The date filter is applied at the SQL level for efficiency
+- Row counts and progress bars reflect only filtered rows
+- Works with both cursor-based and OFFSET pagination
+- Date format: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`
+
+**Common Use Cases:**
+- **Migrate recent data**: `--after-date '2024-01-01' --date-column 'created_at'`
+- **Migrate historical data**: `--before-date '2024-01-01' --date-column 'created_at'`
+- **Migrate specific year**: `--after-date '2024-01-01' --before-date '2025-01-01' --date-column 'created_at'`
+- **Migrate specific month**: `--after-date '2024-01-01' --before-date '2024-02-01' --date-column 'created_at'`
+
+### Date Filtering
+
+The `--after-date`, `--before-date`, and `--date-column` options allow you to migrate only rows that meet date criteria. This is useful for:
+- **Incremental migrations**: Migrate only new data since a specific date (inclusive)
+- **Historical data**: Migrate only data before a specific date
+- **Date range**: Migrate data within a specific date range
+- **Selective migration**: Migrate only specific time periods
+
+**Usage:**
+```bash
+# Migrate only rows where created_at is on or after 2024-01-01 (includes 2024-01-01)
+php migrate.php --data-only --after-date '2024-01-01' --date-column 'created_at'
+
+# Migrate only rows where created_at is before 2024-12-31 (excludes 2024-12-31)
+php migrate.php --data-only --before-date '2024-12-31' --date-column 'created_at'
+
+# Migrate rows within a date range (2024-01-01 to 2024-12-31, inclusive start, exclusive end)
+php migrate.php --data-only --after-date '2024-01-01' --before-date '2024-12-31' --date-column 'created_at'
+
+# With full timestamp
+php migrate.php --full --after-date '2024-01-01 00:00:00' --date-column 'updated_at'
+```
+
+**Important Notes:**
+- `--date-column` is required when using `--after-date` or `--before-date`
+- You can use `--after-date` alone, `--before-date` alone, or both together for a date range
+- `--after-date` uses `>=` (greater than or equal), so the specified date is **included**
+- `--before-date` uses `<` (less than), so the specified date is **excluded**
+- When using both filters together: `date_column >= after_date AND date_column < before_date`
+- The date filter is applied at the SQL level for efficiency
+- Row counts and progress bars reflect only filtered rows
+- Works with both cursor-based and OFFSET pagination
+- Date format: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`
 
 ## Migration Process
 
@@ -427,6 +663,62 @@ php migrate.php --full
 
 # Or skip indexes for faster migration
 php migrate.php --full --skip-indexes
+```
+
+### Selective Table Migration
+
+```bash
+# Migrate only specific tables (full migration)
+php migrate.php --full --tables 'users,orders,products'
+
+# Migrate only specific tables (data-only mode)
+php migrate.php --data-only --tables 'users,orders,products'
+
+# Skip specific tables during migration
+php migrate.php --full --skip-tables 'logs,audit_trail,temp_data'
+
+# Combine table filtering with date filtering
+php migrate.php --data-only --tables 'transactions' --after-date '2024-01-01' --date-column 'created_at'
+
+# Use both include and exclude (exclude takes precedence)
+php migrate.php --full --tables 'users,orders,products,logs' --skip-tables 'logs'
+# Result: Only 'users', 'orders', and 'products' will be migrated (logs is excluded)
+```
+
+### Incremental Migration (Date Filtering)
+
+```bash
+# 1. Initial full migration
+php migrate.php --full
+
+# 2. Later, migrate only new data since a specific date
+php migrate.php --data-only --after-date '2024-01-01' --date-column 'created_at'
+
+# 3. Or migrate only historical data before a specific date
+php migrate.php --data-only --before-date '2024-01-01' --date-column 'created_at'
+
+# 4. Or migrate data within a specific date range
+php migrate.php --data-only --after-date '2024-01-01' --before-date '2024-12-31' --date-column 'created_at'
+
+# 5. Combine with table filtering for specific tables
+php migrate.php --data-only --tables 'transactions,orders' --after-date '2024-01-01' --date-column 'created_at'
+
+# 6. Check for any missing rows
+php migrate.php --find-missing
+```
+
+### Finding Missing Rows
+
+After migration, you can identify any rows that didn't migrate successfully:
+
+```bash
+# Find all missing rows
+php migrate.php --find-missing
+
+# This will show:
+# - Tables with row count mismatches
+# - Sample missing rows (up to 100 per table)
+# - Actual row data that's missing
 ```
 
 ## Support

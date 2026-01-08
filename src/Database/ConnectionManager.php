@@ -12,16 +12,24 @@ class ConnectionManager
     private ?PDO $sourceConnection = null;
     private ?PDO $targetConnection = null;
     private array $config;
+    private ?SshTunnelManager $sshTunnelManager = null;
+    private ?int $sourceTunnelPort = null;
+    private ?int $targetTunnelPort = null;
 
     public function __construct(array $config)
     {
         $this->config = $config;
+        $this->sshTunnelManager = new SshTunnelManager();
     }
 
     public function getSourceConnection(): PDO
     {
         if ($this->sourceConnection === null) {
-            $this->sourceConnection = $this->createConnection($this->config['source']);
+            // Setup SSH tunnel if configured
+            if (isset($this->config['source']['ssh']) && $this->config['source']['ssh']['enabled']) {
+                $this->sourceTunnelPort = $this->setupSshTunnel($this->config['source']['ssh'], $this->config['source']);
+            }
+            $this->sourceConnection = $this->createConnection($this->config['source'], $this->sourceTunnelPort);
         }
 
         return $this->sourceConnection;
@@ -30,17 +38,63 @@ class ConnectionManager
     public function getTargetConnection(): PDO
     {
         if ($this->targetConnection === null) {
-            $this->targetConnection = $this->createConnection($this->config['target']);
+            // Setup SSH tunnel if configured
+            if (isset($this->config['target']['ssh']) && $this->config['target']['ssh']['enabled']) {
+                $this->targetTunnelPort = $this->setupSshTunnel($this->config['target']['ssh'], $this->config['target']);
+            }
+            $this->targetConnection = $this->createConnection($this->config['target'], $this->targetTunnelPort);
         }
 
         return $this->targetConnection;
     }
 
-    private function createConnection(array $config): PDO
+    /**
+     * Setup SSH tunnel for database connection
+     */
+    private function setupSshTunnel(array $sshConfig, array $dbConfig): int
+    {
+        $sshHost = $sshConfig['host'] ?? '';
+        $sshPort = (int)($sshConfig['port'] ?? 22);
+        $sshUser = $sshConfig['user'] ?? '';
+        $sshKeyPath = $sshConfig['key_path'] ?? null;
+        $sshPassword = $sshConfig['password'] ?? null;
+        $remoteHost = $sshConfig['remote_host'] ?? $dbConfig['host'] ?? 'localhost';
+        $remotePort = (int)($sshConfig['remote_port'] ?? $dbConfig['port'] ?? 3306);
+        $localPort = (int)($sshConfig['local_port'] ?? 0);
+
+        if (empty($sshHost) || empty($sshUser)) {
+            throw new \RuntimeException("SSH tunnel requires 'host' and 'user' to be configured");
+        }
+
+        if (empty($sshKeyPath) && empty($sshPassword)) {
+            throw new \RuntimeException("SSH tunnel requires either 'key_path' or 'password' to be configured");
+        }
+
+        return $this->sshTunnelManager->createTunnel(
+            $sshHost,
+            $sshPort,
+            $sshUser,
+            $sshKeyPath,
+            $sshPassword,
+            $remoteHost,
+            $remotePort,
+            $localPort
+        );
+    }
+
+    private function createConnection(array $config, ?int $tunnelPort = null): PDO
     {
         $driver = $config['driver'];
-        $host = $config['host'];
-        $port = $config['port'];
+        
+        // Use tunnel port if SSH tunnel is active, otherwise use configured host/port
+        if ($tunnelPort !== null) {
+            $host = '127.0.0.1';
+            $port = $tunnelPort;
+        } else {
+            $host = $config['host'];
+            $port = $config['port'];
+        }
+        
         $database = $config['database'];
         $username = $config['username'];
         $password = $config['password'];
@@ -88,5 +142,13 @@ class ConnectionManager
     {
         $this->sourceConnection = null;
         $this->targetConnection = null;
+        
+        // Close SSH tunnels
+        if ($this->sshTunnelManager !== null) {
+            $this->sshTunnelManager->closeAllTunnels();
+        }
+        
+        $this->sourceTunnelPort = null;
+        $this->targetTunnelPort = null;
     }
 }

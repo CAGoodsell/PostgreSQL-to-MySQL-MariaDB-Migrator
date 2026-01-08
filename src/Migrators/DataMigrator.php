@@ -35,12 +35,25 @@ class DataMigrator
         $this->schemaMapping = $schemaMapping;
     }
 
-    public function migrateData(array $tablesInclude = [], array $tablesExclude = [], bool $resume = false, ?string $sourceSchema = null): void
+    public function migrateData(array $tablesInclude = [], array $tablesExclude = [], bool $resume = false, ?string $sourceSchema = null, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null): void
     {
         $this->logger->info('Starting data migration...');
         
         if ($sourceSchema !== null) {
             $this->logger->info("Migrating from PostgreSQL schema: {$sourceSchema}");
+        }
+        
+        if ($dateColumn !== null) {
+            $filters = [];
+            if ($afterDate !== null) {
+                $filters[] = "{$dateColumn} >= {$afterDate}";
+            }
+            if ($beforeDate !== null) {
+                $filters[] = "{$dateColumn} < {$beforeDate}";
+            }
+            if (!empty($filters)) {
+                $this->logger->info("Date filter enabled: Only migrating rows where " . implode(' AND ', $filters));
+            }
         }
         
         $sourcePdo = $this->connectionManager->getSourceConnection();
@@ -66,7 +79,7 @@ class DataMigrator
                 $table = $tableInfo['table'];
                 $schema = $tableInfo['schema'];
                 try {
-                    $this->migrateTable($sourcePdo, $targetPdo, $table, $schema, $resume);
+                    $this->migrateTable($sourcePdo, $targetPdo, $table, $schema, $resume, $afterDate, $beforeDate, $dateColumn);
                 } catch (\Exception $e) {
                     $this->logger->error("Failed to migrate table {$schema}.{$table}: " . $e->getMessage());
                     throw $e;
@@ -85,7 +98,7 @@ class DataMigrator
         $this->logger->success('Data migration completed');
     }
 
-    private function migrateTable(PDO $sourcePdo, PDO $targetPdo, string $table, string $schema, bool $resume): void
+    private function migrateTable(PDO $sourcePdo, PDO $targetPdo, string $table, string $schema, bool $resume, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null): void
     {
         $this->logger->info("Migrating data for table: {$schema}.{$table}");
 
@@ -98,8 +111,8 @@ class DataMigrator
             }
         }
 
-        // Get table info
-        $tableInfo = $this->getTableInfo($sourcePdo, $table, $schema);
+        // Get table info (with date filter if provided)
+        $tableInfo = $this->getTableInfo($sourcePdo, $table, $schema, $afterDate, $beforeDate, $dateColumn);
         $totalRows = $tableInfo['row_count'];
         $columns = $tableInfo['columns'];
         $primaryKey = $this->schemaMapping[$table]['columns'] ?? [];
@@ -135,7 +148,10 @@ class DataMigrator
                 $chunkSize,
                 $startOffset,
                 $pkColumn,
-                $useCursorPagination
+                $useCursorPagination,
+                $afterDate,
+                $beforeDate,
+                $dateColumn
             );
 
             if (empty($chunkData)) {
@@ -293,12 +309,31 @@ class DataMigrator
         return array_map(fn($item) => ['table' => $item['table'], 'schema' => $item['schema']], $sizes);
     }
 
-    private function getTableInfo(PDO $pdo, string $table, string $schema = 'public'): array
+    private function getTableInfo(PDO $pdo, string $table, string $schema = 'public', ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null): array
     {
         // Get row count (PostgreSQL - use schema-qualified name with proper quoting)
         $quotedSchema = $this->quotePostgresIdentifier($schema);
         $quotedTable = $this->quotePostgresIdentifier($table);
         $countSql = "SELECT COUNT(*) FROM {$quotedSchema}.{$quotedTable}";
+        
+        // Add date filter if provided
+        if ($dateColumn !== null) {
+            $conditions = [];
+            if ($afterDate !== null) {
+                $quotedDateColumn = $this->quotePostgresIdentifier($dateColumn);
+                $escapedDate = str_replace("'", "''", $afterDate);
+                $conditions[] = "{$quotedDateColumn} >= '{$escapedDate}'";
+            }
+            if ($beforeDate !== null) {
+                $quotedDateColumn = $this->quotePostgresIdentifier($dateColumn);
+                $escapedDate = str_replace("'", "''", $beforeDate);
+                $conditions[] = "{$quotedDateColumn} < '{$escapedDate}'";
+            }
+            if (!empty($conditions)) {
+                $countSql .= " WHERE " . implode(' AND ', $conditions);
+            }
+        }
+        
         $rowCount = (int) $pdo->query($countSql)->fetchColumn();
 
         // Get estimated size - use format() function to properly quote identifiers
@@ -465,7 +500,10 @@ class DataMigrator
         int $chunkSize,
         mixed $offset,
         ?string $pkColumn,
-        bool $useCursorPagination
+        bool $useCursorPagination,
+        ?string $afterDate = null,
+        ?string $beforeDate = null,
+        ?string $dateColumn = null
     ): array {
         $columnNames = array_column($columns, 'column_name');
         // PostgreSQL uses double quotes for identifiers - preserve case
@@ -475,16 +513,42 @@ class DataMigrator
         $quotedTable = $this->quotePostgresIdentifier($table);
         $qualifiedTable = "{$quotedSchema}.{$quotedTable}";
 
+        // Build date filter WHERE clause if provided
+        $dateFilter = '';
+        if ($dateColumn !== null) {
+            $conditions = [];
+            if ($afterDate !== null) {
+                $quotedDateColumn = $this->quotePostgresIdentifier($dateColumn);
+                $escapedDate = str_replace("'", "''", $afterDate);
+                $conditions[] = "{$quotedDateColumn} >= '{$escapedDate}'";
+            }
+            if ($beforeDate !== null) {
+                $quotedDateColumn = $this->quotePostgresIdentifier($dateColumn);
+                $escapedDate = str_replace("'", "''", $beforeDate);
+                $conditions[] = "{$quotedDateColumn} < '{$escapedDate}'";
+            }
+            if (!empty($conditions)) {
+                $dateFilter = " WHERE " . implode(' AND ', $conditions);
+            }
+        }
+
         if ($useCursorPagination && $pkColumn !== null) {
             // Cursor-based pagination (more efficient for large tables)
             $quotedPk = $this->quotePostgresIdentifier($pkColumn);
-            $sql = "SELECT {$columnsList} FROM {$qualifiedTable} WHERE {$quotedPk} > :offset ORDER BY {$quotedPk} LIMIT :limit";
+            $whereClause = $dateFilter ? $dateFilter . " AND {$quotedPk} > :offset" : " WHERE {$quotedPk} > :offset";
+            $sql = "SELECT {$columnsList} FROM {$qualifiedTable}{$whereClause} ORDER BY {$quotedPk} LIMIT :limit";
             $stmt = $pdo->prepare($sql);
             $stmt->bindValue(':offset', $offset, is_int($offset) ? PDO::PARAM_INT : PDO::PARAM_STR);
             $stmt->bindValue(':limit', $chunkSize, PDO::PARAM_INT);
         } else {
             // OFFSET-based pagination
-            $sql = "SELECT {$columnsList} FROM {$qualifiedTable} ORDER BY {$quotedColumns[0]} LIMIT :limit OFFSET :offset";
+            $orderByColumn = $quotedColumns[0];
+            // If date filter exists, order by date column first, then by first column
+            if ($dateFilter && $dateColumn !== null) {
+                $quotedDateColumn = $this->quotePostgresIdentifier($dateColumn);
+                $orderByColumn = "{$quotedDateColumn}, {$orderByColumn}";
+            }
+            $sql = "SELECT {$columnsList} FROM {$qualifiedTable}{$dateFilter} ORDER BY {$orderByColumn} LIMIT :limit OFFSET :offset";
             $stmt = $pdo->prepare($sql);
             $stmt->bindValue(':limit', $chunkSize, PDO::PARAM_INT);
             $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
