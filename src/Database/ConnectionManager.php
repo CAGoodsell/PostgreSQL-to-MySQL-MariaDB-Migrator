@@ -27,7 +27,22 @@ class ConnectionManager
         if ($this->sourceConnection === null) {
             // Setup SSH tunnel if configured
             if (isset($this->config['source']['ssh']) && $this->config['source']['ssh']['enabled']) {
-                $this->sourceTunnelPort = $this->setupSshTunnel($this->config['source']['ssh'], $this->config['source']);
+                $sshHost = $this->config['source']['ssh']['host'] ?? 'unknown';
+                $sshUser = $this->config['source']['ssh']['user'] ?? 'unknown';
+                $remoteHost = $this->config['source']['ssh']['remote_host'] ?? $this->config['source']['host'] ?? 'localhost';
+                $remotePort = $this->config['source']['ssh']['remote_port'] ?? $this->config['source']['port'] ?? 5432;
+                
+                echo "[INFO] Setting up SSH tunnel for PostgreSQL source database...\n";
+                echo "[INFO] SSH Server: {$sshUser}@{$sshHost}\n";
+                echo "[INFO] Remote Database: {$remoteHost}:{$remotePort}\n";
+                
+                try {
+                    $this->sourceTunnelPort = $this->setupSshTunnel($this->config['source']['ssh'], $this->config['source']);
+                    echo "[SUCCESS] SSH tunnel established successfully on local port {$this->sourceTunnelPort}\n";
+                } catch (\Exception $e) {
+                    echo "[ERROR] SSH tunnel failed: " . $e->getMessage() . "\n";
+                    throw $e;
+                }
             }
             $this->sourceConnection = $this->createConnection($this->config['source'], $this->sourceTunnelPort);
         }
@@ -40,7 +55,22 @@ class ConnectionManager
         if ($this->targetConnection === null) {
             // Setup SSH tunnel if configured
             if (isset($this->config['target']['ssh']) && $this->config['target']['ssh']['enabled']) {
-                $this->targetTunnelPort = $this->setupSshTunnel($this->config['target']['ssh'], $this->config['target']);
+                $sshHost = $this->config['target']['ssh']['host'] ?? 'unknown';
+                $sshUser = $this->config['target']['ssh']['user'] ?? 'unknown';
+                $remoteHost = $this->config['target']['ssh']['remote_host'] ?? $this->config['target']['host'] ?? 'localhost';
+                $remotePort = $this->config['target']['ssh']['remote_port'] ?? $this->config['target']['port'] ?? 3306;
+                
+                echo "[INFO] Setting up SSH tunnel for MySQL/MariaDB target database...\n";
+                echo "[INFO] SSH Server: {$sshUser}@{$sshHost}\n";
+                echo "[INFO] Remote Database: {$remoteHost}:{$remotePort}\n";
+                
+                try {
+                    $this->targetTunnelPort = $this->setupSshTunnel($this->config['target']['ssh'], $this->config['target']);
+                    echo "[SUCCESS] SSH tunnel established successfully on local port {$this->targetTunnelPort}\n";
+                } catch (\Exception $e) {
+                    echo "[ERROR] SSH tunnel failed: " . $e->getMessage() . "\n";
+                    throw $e;
+                }
             }
             $this->targetConnection = $this->createConnection($this->config['target'], $this->targetTunnelPort);
         }
@@ -140,14 +170,25 @@ class ConnectionManager
 
     public function closeConnections(): void
     {
-        $this->sourceConnection = null;
-        $this->targetConnection = null;
-        
         // Close SSH tunnels
         if ($this->sshTunnelManager !== null) {
-            $this->sshTunnelManager->closeAllTunnels();
+            $tunnelCount = 0;
+            if ($this->sourceTunnelPort !== null) {
+                $tunnelCount++;
+            }
+            if ($this->targetTunnelPort !== null) {
+                $tunnelCount++;
+            }
+            
+            if ($tunnelCount > 0) {
+                echo "[INFO] Closing {$tunnelCount} SSH tunnel(s)...\n";
+                $this->sshTunnelManager->closeAllTunnels();
+                echo "[SUCCESS] SSH tunnels closed\n";
+            }
         }
         
+        $this->sourceConnection = null;
+        $this->targetConnection = null;
         $this->sourceTunnelPort = null;
         $this->targetTunnelPort = null;
     }

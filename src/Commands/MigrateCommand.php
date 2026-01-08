@@ -62,6 +62,24 @@ class MigrateCommand
 
             // Test connections
             $this->logger->info('Testing database connections...');
+
+            // Check if SSH tunnels are configured
+            $sourceSshEnabled = $this->config['source']['ssh']['enabled'] ?? false;
+            $targetSshEnabled = $this->config['target']['ssh']['enabled'] ?? false;
+
+            if ($sourceSshEnabled || $targetSshEnabled) {
+                if ($sourceSshEnabled) {
+                    $this->logger->info('PostgreSQL source: Using SSH tunnel');
+                } else {
+                    $this->logger->info('PostgreSQL source: Direct connection');
+                }
+                if ($targetSshEnabled) {
+                    $this->logger->info('MySQL/MariaDB target: Using SSH tunnel');
+                } else {
+                    $this->logger->info('MySQL/MariaDB target: Direct connection');
+                }
+            }
+
             $this->connectionManager->testConnections();
             $this->logger->success('Database connections successful');
 

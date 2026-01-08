@@ -164,10 +164,32 @@ class SshTunnelManager
                 // Use -p flag to pass password directly (less secure but simpler)
                 $command = escapeshellcmd($sshpassPath) . ' -p ' . escapeshellarg($sshPassword) . ' ';
             } else {
-                throw new RuntimeException(
-                    "SSH password authentication requires 'sshpass' to be installed. " .
-                    "Install it or use SSH key authentication instead."
-                );
+                $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+                $errorMsg = "SSH password authentication requires 'sshpass' to be installed.\n";
+                
+                if ($isWindows) {
+                    $errorMsg .= "\n";
+                    $errorMsg .= "Windows does not include 'sshpass' by default. Options:\n";
+                    $errorMsg .= "1. Use SSH key authentication instead (recommended):\n";
+                    $errorMsg .= "   - Set PG_SSH_KEY_PATH or MYSQL_SSH_KEY_PATH in your .env file\n";
+                    $errorMsg .= "   - Generate an SSH key pair if needed: ssh-keygen -t rsa -b 4096\n";
+                    $errorMsg .= "   - Copy your public key to the server: ssh-copy-id user@host\n";
+                    $errorMsg .= "\n";
+                    $errorMsg .= "2. Install sshpass for Windows (not recommended):\n";
+                    $errorMsg .= "   - Download from: https://github.com/keimpx/sshpass-windows\n";
+                    $errorMsg .= "   - Add to your system PATH\n";
+                } else {
+                    $errorMsg .= "\n";
+                    $errorMsg .= "Install sshpass:\n";
+                    $errorMsg .= "  - Ubuntu/Debian: sudo apt-get install sshpass\n";
+                    $errorMsg .= "  - CentOS/RHEL: sudo yum install sshpass\n";
+                    $errorMsg .= "  - macOS: brew install hudochenkov/sshpass/sshpass\n";
+                    $errorMsg .= "\n";
+                    $errorMsg .= "Or use SSH key authentication instead (recommended):\n";
+                    $errorMsg .= "  - Set PG_SSH_KEY_PATH or MYSQL_SSH_KEY_PATH in your .env file\n";
+                }
+                
+                throw new RuntimeException($errorMsg);
             }
         }
 
