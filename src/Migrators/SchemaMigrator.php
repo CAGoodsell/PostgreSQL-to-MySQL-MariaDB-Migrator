@@ -261,23 +261,32 @@ class SchemaMigrator
 
     private function getIndexes(PDO $pdo, string $table, string $schema = 'public'): array
     {
+        // Query to get index information including column ordering (ASC/DESC)
+        // PostgreSQL stores sort direction in pg_index.indoption array
+        // Bit 0 of each indoption element: 1 = DESC, 0 = ASC
+        // Use unnest with ordinality to get proper column order and position
         $sql = "
             SELECT
                 i.relname AS index_name,
                 a.attname AS column_name,
                 ix.indisunique AS is_unique,
-                am.amname AS index_type
+                am.amname AS index_type,
+                key_pos.pos AS key_position,
+                COALESCE(opt.opt_value, 0) AS option_value
             FROM pg_class t
             JOIN pg_namespace n ON n.oid = t.relnamespace
             JOIN pg_index ix ON t.oid = ix.indrelid
             JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN pg_am am ON i.relam = am.oid
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+            JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS key_pos(key_attnum, pos) ON true
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = key_pos.key_attnum
+            LEFT JOIN LATERAL unnest(ix.indoption) WITH ORDINALITY AS opt(opt_value, opt_pos) 
+                ON opt.opt_pos = key_pos.pos
             WHERE t.relkind = 'r'
             AND n.nspname = :schema
             AND t.relname = :table
             AND NOT ix.indisprimary
-            ORDER BY i.relname, a.attnum
+            ORDER BY i.relname, key_pos.pos
         ";
 
         $stmt = $pdo->prepare($sql);
@@ -295,7 +304,21 @@ class SchemaMigrator
                     'type' => $row['index_type'],
                 ];
             }
-            $indexes[$indexName]['columns'][] = $row['column_name'];
+            
+            // Extract sort direction from indoption
+            // Bit 0 indicates sort direction: 1 = DESC, 0 = ASC
+            $columnName = $row['column_name'];
+            $sortDirection = 'ASC'; // Default to ASC
+            
+            $optionValue = (int)($row['option_value'] ?? 0);
+            if (($optionValue & 1) === 1) {
+                $sortDirection = 'DESC';
+            }
+            
+            $indexes[$indexName]['columns'][] = [
+                'name' => $columnName,
+                'direction' => $sortDirection,
+            ];
         }
 
         return array_values($indexes);
@@ -581,11 +604,25 @@ class SchemaMigrator
     {
         $indexType = $this->typeConverter->convertIndexType($index['type']);
         $unique = $index['unique'] ? 'UNIQUE ' : '';
-        $columns = array_map([$this, 'quoteIdentifier'], $index['columns']);
         $indexName = $this->quoteIdentifier($index['name']);
         $tableName = $this->quoteIdentifier($table);
 
-        return "CREATE {$unique}INDEX {$indexName} ON {$tableName} (" . implode(', ', $columns) . ") USING {$indexType}";
+        // Build column list with sort direction (ASC/DESC)
+        $columnParts = [];
+        foreach ($index['columns'] as $column) {
+            if (is_array($column)) {
+                // New format with direction
+                $columnName = $this->quoteIdentifier($column['name']);
+                $direction = $column['direction'] ?? 'ASC';
+                $columnParts[] = "{$columnName} {$direction}";
+            } else {
+                // Legacy format (string column name) - default to ASC
+                $columnName = $this->quoteIdentifier($column);
+                $columnParts[] = "{$columnName} ASC";
+            }
+        }
+
+        return "CREATE {$unique}INDEX {$indexName} ON {$tableName} (" . implode(', ', $columnParts) . ") USING {$indexType}";
     }
 
     private function generateForeignKeyStatement(string $table, array $fk): string
@@ -628,5 +665,38 @@ class SchemaMigrator
     private function quotePostgresIdentifier(string $identifier): string
     {
         return '"' . str_replace('"', '""', $identifier) . '"';
+    }
+
+    /**
+     * Parse PostgreSQL array string into PHP array
+     * Handles formats like: {1,2,3} or {1,NULL,3}
+     */
+    private function parsePostgresArray(?string $arrayString): array
+    {
+        if (empty($arrayString)) {
+            return [];
+        }
+
+        // Remove curly braces
+        $arrayString = trim($arrayString, '{}');
+        
+        if (empty($arrayString)) {
+            return [];
+        }
+
+        // Split by comma, handling NULL values
+        $elements = [];
+        $parts = explode(',', $arrayString);
+        
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if (strtoupper($part) === 'NULL') {
+                $elements[] = null;
+            } else {
+                $elements[] = (int)$part;
+            }
+        }
+
+        return $elements;
     }
 }

@@ -66,9 +66,30 @@ class TypeConverter
     public function convertColumnDefinition(array $columnInfo): array
     {
         $pgType = $columnInfo['data_type'] ?? $columnInfo['udt_name'] ?? '';
-        $length = $columnInfo['character_maximum_length'] ?? null;
-        $precision = $columnInfo['numeric_precision'] ?? null;
-        $scale = $columnInfo['numeric_scale'] ?? null;
+        $length = $columnInfo['character_maximum_length'] !== null ? (int)$columnInfo['character_maximum_length'] : null;
+        $precision = $columnInfo['numeric_precision'] !== null ? (int)$columnInfo['numeric_precision'] : null;
+        $scale = $columnInfo['numeric_scale'] !== null ? (int)$columnInfo['numeric_scale'] : null;
+
+        // Normalize scale: PostgreSQL's information_schema may report scale as 0 (int or string)
+        // even when NUMERIC was defined without explicit scale (allowing decimals)
+        // For NUMERIC/DECIMAL types, treat scale=0 as null to allow decimal places
+        // Check both data_type and udt_name, and normalize the type (remove parentheses)
+        $dataType = strtolower($columnInfo['data_type'] ?? '');
+        $udtName = strtolower($columnInfo['udt_name'] ?? '');
+        $normalizedType = strtolower(preg_replace('/\([^)]*\)/', '', $pgType));
+
+        if (
+            in_array($dataType, ['numeric', 'decimal']) ||
+            in_array($udtName, ['numeric', 'decimal']) ||
+            in_array($normalizedType, ['numeric', 'decimal'])
+        ) {
+            // If scale is 0, treat it as null (unspecified) to allow decimal places
+            // This handles the case where PostgreSQL reports scale=0 even for NUMERIC(10) without explicit scale
+            if ($scale === 0) {
+                $scale = null; // Treat as unspecified scale, allowing decimals
+            }
+        }
+
         $isNullable = ($columnInfo['is_nullable'] ?? 'YES') === 'YES';
         $defaultValue = $columnInfo['column_default'] ?? null;
         $isAutoIncrement = str_contains(strtolower($pgType), 'serial');
@@ -150,13 +171,11 @@ class TypeConverter
 
     private function formatDecimal(?int $precision, ?int $scale): string
     {
-        if ($precision !== null && $scale !== null) {
-            return "DECIMAL({$precision},{$scale})";
-        }
-        if ($precision !== null) {
-            return "DECIMAL({$precision})";
-        }
-        return 'DECIMAL';
+        // Ignore PostgreSQL precision and scale values
+        // Always create DECIMAL(20, 10) - 20 total digits, 10 decimal places
+        // This allows up to 10 digits on both sides of the decimal point
+        // (10 integer digits + 10 decimal digits = 20 total precision, 10 scale)
+        return 'DECIMAL(20, 10)';
     }
 
     private function formatVarchar(?int $length): string
@@ -276,9 +295,9 @@ class TypeConverter
         if ($value === null) {
             return null;
         }
-        
+
         $timestamp = trim((string) $value);
-        
+
         // Early validation: check for corrupted years (5+ digits) before any processing
         // This catches cases like "202511-11-13 02:39:00"
         // Check at the very start of the string
@@ -286,7 +305,7 @@ class TypeConverter
             // Year has too many digits - return Unix epoch start
             return '1970-01-01 00:00:00';
         }
-        
+
         // Also check specifically for the pattern: digits-dash pattern at start
         // This is more specific and catches "202511-11-13" format
         if (preg_match('/^(\d+)-/', $timestamp, $matches)) {
@@ -295,11 +314,11 @@ class TypeConverter
                 return '1970-01-01 00:00:00'; // Year has too many digits
             }
         }
-        
+
         // Remove timezone info if present (e.g., "+00:00" or "-05:00")
         $timestamp = preg_replace('/[+-]\d{2}:\d{2}$/', '', $timestamp);
         $timestamp = trim($timestamp);
-        
+
         // Validate the date format (YYYY-MM-DD HH:MM:SS or YYYY-MM-DD)
         // Must start with exactly 4 digits for year
         if (!preg_match('/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2}(\.\d+)?)?$/', $timestamp)) {
@@ -309,15 +328,15 @@ class TypeConverter
                 if (preg_match('/^(\d{5,})/', $timestamp)) {
                     return '1970-01-01 00:00:00';
                 }
-                
+
                 $date = new \DateTime($timestamp);
                 $formatted = $date->format('Y-m-d H:i:s');
-                
+
                 // Double-check the formatted result doesn't have issues
                 if (preg_match('/^(\d{5,})/', $formatted) || strlen($formatted) < 10) {
                     return '1970-01-01 00:00:00'; // Still corrupted after formatting
                 }
-                
+
                 // Validate year in formatted result
                 if (preg_match('/^(\d{4})/', $formatted, $yearMatch)) {
                     $year = (int) $yearMatch[1];
@@ -325,14 +344,14 @@ class TypeConverter
                         return '1970-01-01 00:00:00';
                     }
                 }
-                
+
                 return $formatted;
             } catch (\Exception $e) {
                 // If parsing fails, return Unix epoch start
                 return '1970-01-01 00:00:00';
             }
         }
-        
+
         // Additional validation: check if year is reasonable (1900-2100)
         if (preg_match('/^(\d{4})-\d{2}-\d{2}/', $timestamp, $matches)) {
             $year = (int) $matches[1];
@@ -340,7 +359,7 @@ class TypeConverter
                 return '1970-01-01 00:00:00'; // Invalid year
             }
         }
-        
+
         return $timestamp;
     }
 
@@ -349,21 +368,21 @@ class TypeConverter
         if ($value === null) {
             return null;
         }
-        
+
         $date = (string) $value;
-        
+
         // Check for corrupted dates (e.g., "202511-11-13" - year has too many digits)
         if (preg_match('/^(\d{5,})-\d{2}-\d{2}/', $date)) {
             return '1970-01-01'; // Invalid year - use Unix epoch start
         }
-        
+
         // Validate date format
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
             // Try to parse and reformat
             try {
                 $dateObj = new \DateTime($date);
                 $formatted = $dateObj->format('Y-m-d');
-                
+
                 // Validate year in formatted result
                 if (preg_match('/^(\d{4})/', $formatted, $yearMatch)) {
                     $year = (int) $yearMatch[1];
@@ -371,13 +390,13 @@ class TypeConverter
                         return '1970-01-01';
                     }
                 }
-                
+
                 return $formatted;
             } catch (\Exception $e) {
                 return '1970-01-01'; // Invalid date - use Unix epoch start
             }
         }
-        
+
         // Validate year is reasonable (1900-2100)
         if (preg_match('/^(\d{4})-\d{2}-\d{2}$/', $date, $matches)) {
             $year = (int) $matches[1];
@@ -385,7 +404,7 @@ class TypeConverter
                 return '1970-01-01'; // Invalid year - use Unix epoch start
             }
         }
-        
+
         return $date;
     }
 
@@ -394,9 +413,9 @@ class TypeConverter
         if ($value === null) {
             return null;
         }
-        
+
         $time = (string) $value;
-        
+
         // Validate time format (HH:MM:SS or HH:MM:SS.microseconds)
         if (!preg_match('/^\d{2}:\d{2}:\d{2}(\.\d+)?$/', $time)) {
             // Try to parse and reformat
@@ -407,7 +426,7 @@ class TypeConverter
                 return null; // Invalid time
             }
         }
-        
+
         return $time;
     }
 }
