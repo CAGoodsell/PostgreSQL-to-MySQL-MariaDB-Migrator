@@ -10,6 +10,7 @@ class ProgressLogger
     private string $checkpointDir;
     private $logHandle;
     private array $checkpoints = [];
+    private array $tableStartTimes = [];
 
     public function __construct(string $logDir, string $checkpointDir)
     {
@@ -61,27 +62,41 @@ class ProgressLogger
 
     public function progress(string $table, int $processed, int $total, float $percentage): void
     {
+        // Track start time for this table if not already set
+        if (!isset($this->tableStartTimes[$table])) {
+            $this->tableStartTimes[$table] = microtime(true);
+        }
+
         $barLength = 50;
         $filled = (int) ($barLength * $percentage / 100);
         $bar = str_repeat('=', $filled) . str_repeat(' ', $barLength - $filled);
         
+        // Calculate estimated time to completion
+        $eta = $this->calculateETA($table, $processed, $total, $percentage);
+        
         $message = sprintf(
-            "%s: [%s] %d/%d (%.2f%%)",
+            "%s: [%s] %d/%d (%.2f%%) %s",
             $table,
             $bar,
             $processed,
             $total,
-            $percentage
+            $percentage,
+            $eta
         );
         
         // Output to console with carriage return to overwrite same line
-        echo "\r" . str_pad($message, 120) . "\033[K"; // \033[K clears to end of line
+        echo "\r" . str_pad($message, 150) . "\033[K"; // \033[K clears to end of line
         flush();
         
         // Also log to file (with newline for file)
         $timestamp = date('Y-m-d H:i:s');
         $logMessage = "[{$timestamp}] [PROGRESS] {$message}\n";
         fwrite($this->logHandle, $logMessage);
+        
+        // Clear start time when table is complete
+        if ($percentage >= 100) {
+            unset($this->tableStartTimes[$table]);
+        }
     }
 
     public function saveCheckpoint(string $table, array $data): void
@@ -152,6 +167,65 @@ class ProgressLogger
     public function getLogFile(): string
     {
         return $this->logFile;
+    }
+
+    /**
+     * Calculate estimated time to completion
+     */
+    private function calculateETA(string $table, int $processed, int $total, float $percentage): string
+    {
+        // If already complete or no progress, don't show ETA
+        if ($processed <= 0 || $percentage >= 100) {
+            return '';
+        }
+
+        $startTime = $this->tableStartTimes[$table];
+        $elapsedTime = microtime(true) - $startTime;
+        
+        // Need at least 1 second of data for meaningful estimate
+        if ($elapsedTime < 1.0) {
+            return 'ETA: calculating...';
+        }
+
+        // Calculate rate (rows per second)
+        $rowsPerSecond = $processed / $elapsedTime;
+        
+        // Calculate remaining rows
+        $remainingRows = $total - $processed;
+        
+        // Calculate estimated seconds remaining
+        $estimatedSeconds = $remainingRows / $rowsPerSecond;
+        
+        // Format time in human-readable format
+        return 'ETA: ' . $this->formatTime($estimatedSeconds);
+    }
+
+    /**
+     * Format seconds into human-readable time string
+     */
+    private function formatTime(float $seconds): string
+    {
+        if ($seconds < 60) {
+            return sprintf('%ds', (int) $seconds);
+        }
+        
+        $minutes = (int) ($seconds / 60);
+        $remainingSeconds = (int) ($seconds % 60);
+        
+        if ($minutes < 60) {
+            if ($remainingSeconds > 0) {
+                return sprintf('%dm %ds', $minutes, $remainingSeconds);
+            }
+            return sprintf('%dm', $minutes);
+        }
+        
+        $hours = (int) ($minutes / 60);
+        $remainingMinutes = $minutes % 60;
+        
+        if ($remainingMinutes > 0) {
+            return sprintf('%dh %dm', $hours, $remainingMinutes);
+        }
+        return sprintf('%dh', $hours);
     }
 
     public function __destruct()

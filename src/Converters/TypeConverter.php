@@ -94,7 +94,13 @@ class TypeConverter
         $defaultValue = $columnInfo['column_default'] ?? null;
         $isAutoIncrement = str_contains(strtolower($pgType), 'serial');
 
-        $mariadbType = $this->convertDataType($pgType, $length, $precision, $scale);
+        // Special handling: if column is named "password", convert to TEXT
+        $columnName = strtolower($columnInfo['column_name'] ?? '');
+        if ($columnName === 'password') {
+            $mariadbType = 'TEXT';
+        } else {
+            $mariadbType = $this->convertDataType($pgType, $length, $precision, $scale);
+        }
 
         // Handle default values
         $mariadbDefault = $this->convertDefaultValue($defaultValue, $mariadbType, $isAutoIncrement);
