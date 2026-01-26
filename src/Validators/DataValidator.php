@@ -86,9 +86,10 @@ class DataValidator
         ];
     }
 
-    private function getRowCount(PDO $pdo, string $table): int
+    private function getRowCount(PDO $pdo, string $table, ?string $sourceSchema = null): int
     {
-        $sql = "SELECT COUNT(*) FROM " . $this->quoteIdentifier($table);
+        $tableRef = $this->quoteTableForPdo($pdo, $table, $sourceSchema);
+        $sql = "SELECT COUNT(*) FROM {$tableRef}";
         return (int) $pdo->query($sql)->fetchColumn();
     }
 
@@ -101,15 +102,18 @@ class DataValidator
         }
 
         $columnNames = array_column($columns, 'column_name');
-        $quotedColumns = array_map([$this, 'quoteIdentifier'], $columnNames);
-        $columnsList = implode(', ', $quotedColumns);
-        $tableName = $this->quoteIdentifier($table);
+        $sourceQuotedColumns = array_map(fn(string $c) => $this->quoteIdentifierForPdo($sourcePdo, $c), $columnNames);
+        $targetQuotedColumns = array_map(fn(string $c) => $this->quoteIdentifierForPdo($targetPdo, $c), $columnNames);
+        $sourceColumnsList = implode(', ', $sourceQuotedColumns);
+        $targetColumnsList = implode(', ', $targetQuotedColumns);
+        $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table);
+        $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
 
         // Fetch sample from both databases
         $sampleSize = min(100, $this->getRowCount($sourcePdo, $table));
         
-        $sourceSql = "SELECT {$columnsList} FROM {$tableName} LIMIT {$sampleSize}";
-        $targetSql = "SELECT {$columnsList} FROM {$tableName} LIMIT {$sampleSize}";
+        $sourceSql = "SELECT {$sourceColumnsList} FROM {$sourceTableRef} LIMIT {$sampleSize}";
+        $targetSql = "SELECT {$targetColumnsList} FROM {$targetTableRef} LIMIT {$sampleSize}";
 
         $sourceData = $sourcePdo->query($sourceSql)->fetchAll(PDO::FETCH_ASSOC);
         $targetData = $targetPdo->query($targetSql)->fetchAll(PDO::FETCH_ASSOC);
@@ -119,8 +123,8 @@ class DataValidator
         }
 
         // Compare rows (order may differ, so compare as sets)
-        $sourceHashes = array_map(fn($row) => md5(json_encode($row, SORT_KEYS)), $sourceData);
-        $targetHashes = array_map(fn($row) => md5(json_encode($row, SORT_KEYS)), $targetData);
+        $sourceHashes = array_map(fn(array $row) => $this->hashRow($row), $sourceData);
+        $targetHashes = array_map(fn(array $row) => $this->hashRow($row), $targetData);
 
         sort($sourceHashes);
         sort($targetHashes);
@@ -249,7 +253,7 @@ class DataValidator
             $this->logger->info("Checking table: {$table}");
             
             try {
-                $sourceRows = $this->getRowCount($sourcePdo, $table);
+                $sourceRows = $this->getRowCount($sourcePdo, $table, $sourceSchema);
                 $targetRows = $this->getRowCount($targetPdo, $table);
                 
                 if ($sourceRows === $targetRows) {
@@ -304,37 +308,44 @@ class DataValidator
 
     private function findMissingRowsByPrimaryKey(PDO $sourcePdo, PDO $targetPdo, string $table, string $pkColumn, ?string $sourceSchema, int $limit): array
     {
-        $quotedPk = $this->quoteIdentifier($pkColumn);
-        $quotedTable = $this->quoteIdentifier($table);
-        
-        // Build source table reference
-        if ($sourceSchema !== null) {
-            $sourceTableRef = $this->quotePostgresIdentifier($sourceSchema) . '.' . $this->quotePostgresIdentifier($table);
-        } else {
-            $sourceTableRef = $quotedTable;
-        }
-        
-        // Find rows in source that don't exist in target
-        $sql = "
-            SELECT s.{$quotedPk}
-            FROM {$sourceTableRef} s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {$quotedTable} t WHERE t.{$quotedPk} = s.{$quotedPk}
-            )
-            LIMIT {$limit}
-        ";
-        
         try {
-            $stmt = $sourcePdo->query($sql);
-            $missingPks = $stmt->fetchAll(PDO::FETCH_COLUMN);
-            
+            $sourcePk = $this->quoteIdentifierForPdo($sourcePdo, $pkColumn);
+            $targetPk = $this->quoteIdentifierForPdo($targetPdo, $pkColumn);
+            $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table, $sourceSchema);
+            $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
+
+            // Pull a sample of PKs from source, then check which ones exist in target.
+            $sourceLimit = max(1, (int) $limit) * 2;
+            $pkSql = "SELECT {$sourcePk} FROM {$sourceTableRef} LIMIT {$sourceLimit}";
+            $sourcePks = $sourcePdo->query($pkSql)->fetchAll(PDO::FETCH_COLUMN);
+
+            if (empty($sourcePks)) {
+                return [];
+            }
+
+            $placeholders = implode(',', array_fill(0, count($sourcePks), '?'));
+            $existsSql = "SELECT {$targetPk} FROM {$targetTableRef} WHERE {$targetPk} IN ({$placeholders})";
+            $stmt = $targetPdo->prepare($existsSql);
+            $stmt->execute($sourcePks);
+            $existing = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            $existingSet = array_fill_keys($existing, true);
+
+            $missingPks = [];
+            foreach ($sourcePks as $pk) {
+                if (!isset($existingSet[$pk])) {
+                    $missingPks[] = $pk;
+                    if (count($missingPks) >= $limit) {
+                        break;
+                    }
+                }
+            }
+
             if (empty($missingPks)) {
                 return [];
             }
-            
-            // Get full row data for missing primary keys
-            $pkPlaceholders = implode(',', array_fill(0, count($missingPks), '?'));
-            $selectSql = "SELECT * FROM {$sourceTableRef} WHERE {$quotedPk} IN ({$pkPlaceholders})";
+
+            $missingPlaceholders = implode(',', array_fill(0, count($missingPks), '?'));
+            $selectSql = "SELECT * FROM {$sourceTableRef} WHERE {$sourcePk} IN ({$missingPlaceholders})";
             $stmt = $sourcePdo->prepare($selectSql);
             $stmt->execute($missingPks);
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -353,20 +364,15 @@ class DataValidator
         }
         
         $columnNames = array_column($columns, 'column_name');
-        $quotedColumns = array_map([$this, 'quoteIdentifier'], $columnNames);
-        $columnsList = implode(', ', $quotedColumns);
+        $sourceQuotedColumns = array_map(fn(string $c) => $this->quoteIdentifierForPdo($sourcePdo, $c), $columnNames);
+        $columnsList = implode(', ', $sourceQuotedColumns);
         
-        // Build source table reference
-        if ($sourceSchema !== null) {
-            $sourceTableRef = $this->quotePostgresIdentifier($sourceSchema) . '.' . $this->quotePostgresIdentifier($table);
-        } else {
-            $sourceTableRef = $this->quoteIdentifier($table);
-        }
-        
-        $targetTableRef = $this->quoteIdentifier($table);
+        $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table, $sourceSchema);
+        $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
         
         // Get sample rows from source
-        $sourceSql = "SELECT {$columnsList} FROM {$sourceTableRef} LIMIT {$limit * 2}";
+        $sourceLimit = $limit * 2;
+        $sourceSql = "SELECT {$columnsList} FROM {$sourceTableRef} LIMIT {$sourceLimit}";
         $sourceRows = $sourcePdo->query($sourceSql)->fetchAll(PDO::FETCH_ASSOC);
         
         if (empty($sourceRows)) {
@@ -380,7 +386,7 @@ class DataValidator
             $params = [];
             
             foreach ($columnNames as $col) {
-                $quotedCol = $this->quoteIdentifier($col);
+                $quotedCol = $this->quoteIdentifierForPdo($targetPdo, $col);
                 if ($sourceRow[$col] === null) {
                     $whereConditions[] = "{$quotedCol} IS NULL";
                 } else {
@@ -462,48 +468,40 @@ class DataValidator
         }
     }
 
-    private function getColumns(PDO $pdo, string $table, ?string $sourceSchema = null): array
-    {
-        try {
-            // Try PostgreSQL first
-            if ($sourceSchema !== null) {
-                $escapedSchema = str_replace("'", "''", $sourceSchema);
-                $escapedTable = str_replace("'", "''", $table);
-                $sql = "
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = '{$escapedSchema}' AND table_name = '{$escapedTable}'
-                    ORDER BY ordinal_position
-                ";
-            } else {
-                $escapedTable = str_replace("'", "''", $table);
-                $sql = "
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = '{$escapedTable}'
-                    ORDER BY ordinal_position
-                ";
-            }
-            
-            $stmt = $pdo->query($sql);
-            return $stmt->fetchAll(PDO::FETCH_ASSOC);
-        } catch (\Exception $e) {
-            // Not PostgreSQL, try MySQL/MariaDB
-            $sql = "
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = DATABASE() AND table_name = ?
-                ORDER BY ordinal_position
-            ";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute([$table]);
-            return $stmt->fetchAll(PDO::FETCH_ASSOC);
-        }
-    }
-
     private function quotePostgresIdentifier(string $identifier): string
     {
         return '"' . str_replace('"', '""', $identifier) . '"';
+    }
+
+    private function quoteIdentifierForPdo(PDO $pdo, string $identifier): string
+    {
+        $driver = (string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        if ($driver === 'pgsql') {
+            return $this->quotePostgresIdentifier($identifier);
+        }
+
+        return $this->quoteIdentifier($identifier);
+    }
+
+    private function quoteTableForPdo(PDO $pdo, string $table, ?string $schema = null): string
+    {
+        $driver = (string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        if ($driver === 'pgsql') {
+            $quotedTable = $this->quotePostgresIdentifier($table);
+            if ($schema !== null && $schema !== '') {
+                return $this->quotePostgresIdentifier($schema) . '.' . $quotedTable;
+            }
+            return $quotedTable;
+        }
+
+        return $this->quoteIdentifier($table);
+    }
+
+    private function hashRow(array $row): string
+    {
+        // Stable hashing regardless of key order
+        ksort($row);
+        return md5(json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     }
 
     private function quoteIdentifier(string $identifier): string

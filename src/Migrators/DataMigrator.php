@@ -74,12 +74,39 @@ class DataMigrator
         // Sort tables by size (estimate) - migrate smaller tables first
         $tablesWithSchemas = $this->sortTablesBySize($sourcePdo, $tablesWithSchemas);
 
+        // Pre-compute total rows across all tables for overall progress/ETA (honors date filters)
+        $this->logger->info('Calculating overall migration estimate (row counts)...');
+        $precomputedTableInfo = [];
+        $overallTotalRows = 0;
+        foreach ($tablesWithSchemas as $tableInfo) {
+            $table = $tableInfo['table'];
+            $schema = $tableInfo['schema'];
+            $info = $this->getTableInfo($sourcePdo, $table, $schema, $afterDate, $beforeDate, $dateColumn);
+            $precomputedTableInfo[$schema][$table] = $info;
+            $overallTotalRows += (int) ($info['row_count'] ?? 0);
+        }
+
+        $overallProcessedRows = 0;
+
         try {
             foreach ($tablesWithSchemas as $tableInfo) {
                 $table = $tableInfo['table'];
                 $schema = $tableInfo['schema'];
                 try {
-                    $this->migrateTable($sourcePdo, $targetPdo, $table, $schema, $resume, $afterDate, $beforeDate, $dateColumn);
+                    $tableInfoWithCounts = $precomputedTableInfo[$schema][$table] ?? $this->getTableInfo($sourcePdo, $table, $schema, $afterDate, $beforeDate, $dateColumn);
+                    $this->migrateTable(
+                        $sourcePdo,
+                        $targetPdo,
+                        $table,
+                        $schema,
+                        $resume,
+                        $tableInfoWithCounts,
+                        $overallProcessedRows,
+                        $overallTotalRows,
+                        $afterDate,
+                        $beforeDate,
+                        $dateColumn
+                    );
                 } catch (\Exception $e) {
                     $this->logger->error("Failed to migrate table {$schema}.{$table}: " . $e->getMessage());
                     throw $e;
@@ -98,7 +125,19 @@ class DataMigrator
         $this->logger->success('Data migration completed');
     }
 
-    private function migrateTable(PDO $sourcePdo, PDO $targetPdo, string $table, string $schema, bool $resume, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null): void
+    private function migrateTable(
+        PDO $sourcePdo,
+        PDO $targetPdo,
+        string $table,
+        string $schema,
+        bool $resume,
+        array $tableInfo,
+        int &$overallProcessedRows,
+        int $overallTotalRows,
+        ?string $afterDate = null,
+        ?string $beforeDate = null,
+        ?string $dateColumn = null
+    ): void
     {
         $this->logger->info("Migrating data for table: {$schema}.{$table}");
 
@@ -111,8 +150,6 @@ class DataMigrator
             }
         }
 
-        // Get table info (with date filter if provided)
-        $tableInfo = $this->getTableInfo($sourcePdo, $table, $schema, $afterDate, $beforeDate, $dateColumn);
         $totalRows = $tableInfo['row_count'];
         $columns = $tableInfo['columns'];
         $primaryKey = $this->schemaMapping[$table]['columns'] ?? [];
@@ -134,6 +171,7 @@ class DataMigrator
         // Calculate starting offset
         $startOffset = $checkpoint ? $checkpoint['last_offset'] : 0;
         $processedRows = $startOffset;
+        $overallProcessedRows += (int) $startOffset;
 
         // Get primary key column for cursor-based pagination (more efficient than OFFSET)
         $pkColumn = $this->getPrimaryKeyColumn($table);
@@ -165,8 +203,19 @@ class DataMigrator
             $rowsInChunk = count($chunkData);
             $processedRows += $rowsInChunk;
             $percentage = ($processedRows / $totalRows) * 100;
+
+            $overallProcessedRows += $rowsInChunk;
+            $overallPercentage = $overallTotalRows > 0 ? ($overallProcessedRows / $overallTotalRows) * 100 : 0.0;
             
-            $this->logger->progress($table, $processedRows, $totalRows, $percentage);
+            $this->logger->progress(
+                $table,
+                $processedRows,
+                $totalRows,
+                $percentage,
+                $overallProcessedRows,
+                $overallTotalRows,
+                $overallPercentage
+            );
             
             // Get last PK value for cursor pagination BEFORE freeing memory
             $lastPkValue = null;

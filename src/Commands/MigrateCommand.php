@@ -52,6 +52,7 @@ class MigrateCommand
 
     public function execute(string $mode = 'full', bool $resume = false): void
     {
+        $runStart = microtime(true);
         try {
             $this->logger->info('=== PostgreSQL to MariaDB Migration Tool ===');
             $this->logger->info('Mode: ' . strtoupper($mode));
@@ -274,15 +275,40 @@ class MigrateCommand
                 }
             }
 
+            $durationSeconds = microtime(true) - $runStart;
             $this->logger->success('=== Migration completed ===');
+            $this->logger->success('Total migration time: ' . $this->formatDuration($durationSeconds));
             $this->logger->info("Log file: {$this->logger->getLogFile()}");
         } catch (\Exception $e) {
+            $durationSeconds = microtime(true) - $runStart;
             $this->logger->error('Migration failed: ' . $e->getMessage());
+            $this->logger->error('Total run time before failure: ' . $this->formatDuration($durationSeconds));
             $this->logger->error('Stack trace: ' . $e->getTraceAsString());
             throw $e;
         } finally {
             $this->connectionManager->closeConnections();
         }
+    }
+
+    private function formatDuration(float $seconds): string
+    {
+        if (!is_finite($seconds) || $seconds <= 0) {
+            return '0s';
+        }
+
+        $total = (int) ceil($seconds);
+
+        $hours = intdiv($total, 3600);
+        $minutes = intdiv($total % 3600, 60);
+        $secs = $total % 60;
+
+        if ($hours > 0) {
+            return sprintf('%dh %dm %ds', $hours, $minutes, $secs);
+        }
+        if ($minutes > 0) {
+            return sprintf('%dm %ds', $minutes, $secs);
+        }
+        return sprintf('%ds', $secs);
     }
 
     public static function parseArguments(array $argv): array
@@ -363,6 +389,20 @@ class MigrateCommand
                 100 // Limit per table
             );
 
+            // Build an example --data-only command from results
+            // Include tables that have missing rows or errored (e.g., missing table on target)
+            $tablesNeedingMigration = [];
+            foreach ($results as $table => $result) {
+                if (isset($result['error'])) {
+                    $tablesNeedingMigration[] = $table;
+                    continue;
+                }
+                if (!empty($result['missing_rows'] ?? [])) {
+                    $tablesNeedingMigration[] = $table;
+                }
+            }
+            $tablesNeedingMigration = array_values(array_unique($tablesNeedingMigration));
+
             // Display results
             $this->logger->info("\n=== Missing Rows Report ===");
             foreach ($results as $table => $result) {
@@ -395,6 +435,17 @@ class MigrateCommand
                 $this->logger->success("\nNo missing rows found! All data appears to be migrated.");
             } else {
                 $this->logger->error("\nFound missing rows in {$tablesWithMissing} table(s)");
+            }
+
+            // Suggest a command the user can copy/paste to migrate only affected tables
+            if (!empty($tablesNeedingMigration)) {
+                $tablesArg = implode(',', $tablesNeedingMigration);
+                $example = "php migrate.php --data-only --tables '{$tablesArg}'";
+                if ($sourceSchema !== null && $sourceSchema !== '') {
+                    $example .= "  # using source schema '{$sourceSchema}' from config/args";
+                }
+                $this->logger->info("\nExample command to (re)run data-only for these tables:");
+                $this->logger->info("  {$example}");
             }
         } catch (\Exception $e) {
             $this->logger->error('Failed to find missing rows: ' . $e->getMessage());

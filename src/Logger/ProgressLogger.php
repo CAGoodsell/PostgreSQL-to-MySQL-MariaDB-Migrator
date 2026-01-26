@@ -11,6 +11,7 @@ class ProgressLogger
     private $logHandle;
     private array $checkpoints = [];
     private array $tableStartTimes = [];
+    private ?float $overallStartTime = null;
 
     public function __construct(string $logDir, string $checkpointDir)
     {
@@ -60,21 +61,31 @@ class ProgressLogger
         $this->log($message, 'SUCCESS');
     }
 
-    public function progress(string $table, int $processed, int $total, float $percentage): void
+    public function progress(
+        string $table,
+        int $processed,
+        int $total,
+        float $percentage,
+        ?int $overallProcessed = null,
+        ?int $overallTotal = null,
+        ?float $overallPercentage = null
+    ): void
     {
         // Track start time for this table if not already set
         if (!isset($this->tableStartTimes[$table])) {
             $this->tableStartTimes[$table] = microtime(true);
         }
 
-        $barLength = 50;
+        // Keep the console progress line compact to avoid wrapping.
+        $barLength = 30;
         $filled = (int) ($barLength * $percentage / 100);
         $bar = str_repeat('=', $filled) . str_repeat(' ', $barLength - $filled);
         
         // Calculate estimated time to completion
         $eta = $this->calculateETA($table, $processed, $total, $percentage);
-        
-        $message = sprintf(
+
+        // Full detail message (logged to file)
+        $fileMessage = sprintf(
             "%s: [%s] %d/%d (%.2f%%) %s",
             $table,
             $bar,
@@ -83,20 +94,89 @@ class ProgressLogger
             $percentage,
             $eta
         );
+
+        // Console message (compact)
+        $tableLabel = $table;
+        if (strlen($tableLabel) > 18) {
+            $tableLabel = substr($tableLabel, 0, 18);
+        }
+        $consoleMessage = sprintf(
+            "%s [%s] %.2f%% %s",
+            $tableLabel,
+            $bar,
+            $percentage,
+            $eta
+        );
+
+        // Optional overall migration progress + ETA (shown on same line)
+        if ($overallProcessed !== null && $overallTotal !== null && $overallPercentage !== null && $overallTotal > 0) {
+            if ($this->overallStartTime === null) {
+                $this->overallStartTime = microtime(true);
+            }
+
+            $overallEta = $this->calculateOverallETA($overallProcessed, $overallTotal, $overallPercentage);
+
+            $overallBarLength = 15;
+            $overallFilled = (int) ($overallBarLength * $overallPercentage / 100);
+            $overallBar = str_repeat('=', $overallFilled) . str_repeat(' ', $overallBarLength - $overallFilled);
+
+            $fileMessage .= sprintf(
+                " | Total: [%s] %d/%d (%.2f%%) %s",
+                $overallBar,
+                $overallProcessed,
+                $overallTotal,
+                $overallPercentage,
+                $overallEta
+            );
+
+            $consoleMessage .= sprintf(
+                " | Total [%s] %.2f%% %s",
+                $overallBar,
+                $overallPercentage,
+                $overallEta
+            );
+        }
         
-        // Output to console with carriage return to overwrite same line
-        echo "\r" . str_pad($message, 150) . "\033[K"; // \033[K clears to end of line
+        // Output to console with carriage return to overwrite same line.
+        // IMPORTANT: If the line is wider than the terminal, it will wrap and appear as "new lines".
+        // So we truncate/pad to the current terminal width.
+        $width = $this->getTerminalWidth();
+        $rendered = $consoleMessage;
+        if (strlen($rendered) >= $width) {
+            // Leave at least 1 char for safety; no ellipsis to keep it stable.
+            $rendered = substr($rendered, 0, max(1, $width - 1));
+        }
+        $pad = max(0, $width - strlen($rendered));
+        echo "\r" . $rendered . str_repeat(' ', $pad) . "\033[K"; // \033[K clears to end of line
         flush();
         
         // Also log to file (with newline for file)
         $timestamp = date('Y-m-d H:i:s');
-        $logMessage = "[{$timestamp}] [PROGRESS] {$message}\n";
+        $logMessage = "[{$timestamp}] [PROGRESS] {$fileMessage}\n";
         fwrite($this->logHandle, $logMessage);
         
         // Clear start time when table is complete
         if ($percentage >= 100) {
             unset($this->tableStartTimes[$table]);
         }
+    }
+
+    private function getTerminalWidth(): int
+    {
+        // Common env vars set by many terminals (including CI). On Windows these may be absent.
+        $columns = getenv('COLUMNS');
+        if ($columns === false && isset($_SERVER['COLUMNS'])) {
+            $columns = (string) $_SERVER['COLUMNS'];
+        }
+
+        $width = is_string($columns) ? (int) $columns : 0;
+        // Safe default: keep conservative to avoid wrapping.
+        if ($width <= 0) {
+            return 120;
+        }
+
+        // Avoid tiny/absurd values
+        return max(60, min(400, $width));
     }
 
     public function saveCheckpoint(string $table, array $data): void
@@ -201,16 +281,52 @@ class ProgressLogger
     }
 
     /**
+     * Calculate overall ETA for full migration progress.
+     */
+    private function calculateOverallETA(int $processed, int $total, float $percentage): string
+    {
+        if ($processed <= 0 || $percentage >= 100 || $this->overallStartTime === null) {
+            return '';
+        }
+
+        $elapsedTime = microtime(true) - $this->overallStartTime;
+        if ($elapsedTime < 1.0) {
+            return 'ETA: calculating...';
+        }
+
+        $rowsPerSecond = $processed / $elapsedTime;
+        if ($rowsPerSecond <= 0) {
+            return 'ETA: calculating...';
+        }
+
+        $remainingRows = $total - $processed;
+        if ($remainingRows <= 0) {
+            return '';
+        }
+
+        $estimatedSeconds = $remainingRows / $rowsPerSecond;
+        return 'ETA: ' . $this->formatTime($estimatedSeconds);
+    }
+
+    /**
      * Format seconds into human-readable time string
      */
     private function formatTime(float $seconds): string
     {
-        if ($seconds < 60) {
-            return sprintf('%ds', (int) $seconds);
+        // Round up so ETA never underestimates, and use integer math to avoid
+        // float-to-int precision loss warnings (PHP 8.1+).
+        if (!is_finite($seconds) || $seconds <= 0) {
+            return '0s';
+        }
+
+        $totalSeconds = (int) ceil($seconds);
+
+        if ($totalSeconds < 60) {
+            return sprintf('%ds', $totalSeconds); 
         }
         
-        $minutes = (int) ($seconds / 60);
-        $remainingSeconds = (int) ($seconds % 60);
+        $minutes = intdiv($totalSeconds, 60);
+        $remainingSeconds = $totalSeconds % 60;
         
         if ($minutes < 60) {
             if ($remainingSeconds > 0) {
@@ -219,7 +335,7 @@ class ProgressLogger
             return sprintf('%dm', $minutes);
         }
         
-        $hours = (int) ($minutes / 60);
+        $hours = intdiv($minutes, 60);
         $remainingMinutes = $minutes % 60;
         
         if ($remainingMinutes > 0) {
