@@ -54,6 +54,7 @@ return [
         'parallel_workers' => (int) env('MIGRATION_PARALLEL_WORKERS', 4),
         'checkpoint_interval' => (int) env('MIGRATION_CHECKPOINT_INTERVAL', 100),
         'skip_indexes' => (bool) env('MIGRATION_SKIP_INDEXES', false),
+        'lowercase_table_names' => (bool) env('MIGRATION_LOWERCASE_TABLE_NAMES', false),
         'tables_include' => env('MIGRATION_TABLES_INCLUDE', '') ? explode(',', env('MIGRATION_TABLES_INCLUDE')) : [],
         'tables_exclude' => env('MIGRATION_TABLES_EXCLUDE', '') ? explode(',', env('MIGRATION_TABLES_EXCLUDE')) : [],
     ],

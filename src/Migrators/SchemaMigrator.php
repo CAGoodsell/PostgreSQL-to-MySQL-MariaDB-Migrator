@@ -7,6 +7,7 @@ namespace Migration\Migrators;
 use Migration\Converters\TypeConverter;
 use Migration\Database\ConnectionManager;
 use Migration\Logger\ProgressLogger;
+use Migration\Support\TableNaming;
 use PDO;
 
 class SchemaMigrator
@@ -15,17 +16,25 @@ class SchemaMigrator
     private TypeConverter $typeConverter;
     private ProgressLogger $logger;
     private bool $dryRun;
+    private bool $lowercaseTableNames;
 
     public function __construct(
         ConnectionManager $connectionManager,
         TypeConverter $typeConverter,
         ProgressLogger $logger,
-        bool $dryRun = false
+        bool $dryRun = false,
+        bool $lowercaseTableNames = false
     ) {
         $this->connectionManager = $connectionManager;
         $this->typeConverter = $typeConverter;
         $this->logger = $logger;
         $this->dryRun = $dryRun;
+        $this->lowercaseTableNames = $lowercaseTableNames;
+    }
+
+    private function targetTableName(string $sourceTable): string
+    {
+        return TableNaming::toTarget($sourceTable, $this->lowercaseTableNames);
     }
 
     public function migrateSchema(array $tablesInclude = [], array $tablesExclude = [], ?string $sourceSchema = null): array
@@ -61,10 +70,12 @@ class SchemaMigrator
                 }
                 
                 $this->logger->info("Table {$schema}.{$table} has " . count($tableSchema['columns']) . " columns");
-                $createStatement = $this->generateCreateTableStatement($table, $tableSchema);
+                $targetTable = $this->targetTableName($table);
+                $createStatement = $this->generateCreateTableStatement($targetTable, $tableSchema);
                 
                 $schemaMapping[$table] = [
                     'schema' => $schema,
+                    'target_table' => $targetTable,
                     'columns' => $tableSchema['columns'],
                     'indexes' => $tableSchema['indexes'],
                     'foreign_keys' => $tableSchema['foreign_keys'],
@@ -72,9 +83,11 @@ class SchemaMigrator
 
                 if (!$this->dryRun) {
                     $targetPdo->exec($createStatement);
-                    $this->logger->success("Created table: {$table}");
+                    $this->logger->success($targetTable !== $table
+                        ? "Created table: {$targetTable} (from {$table})"
+                        : "Created table: {$table}");
                 } else {
-                    $this->logger->info("DRY RUN - Would create table: {$table}");
+                    $this->logger->info("DRY RUN - Would create table: {$targetTable}" . ($targetTable !== $table ? " (from {$table})" : ''));
                     $this->logger->info("SQL: " . $createStatement);
                 }
             } catch (\Exception $e) {
@@ -421,19 +434,20 @@ class SchemaMigrator
         $this->logger->info('Creating indexes...');
         $targetPdo = $this->connectionManager->getTargetConnection();
 
-        foreach ($schemaMapping as $table => $schema) {
+        foreach ($schemaMapping as $sourceTable => $schema) {
+            $targetTable = $schema['target_table'] ?? $sourceTable;
             foreach ($schema['indexes'] as $index) {
                 try {
-                    $indexSql = $this->generateIndexStatement($table, $index);
+                    $indexSql = $this->generateIndexStatement($targetTable, $index);
                     
                     if (!$this->dryRun) {
                         $targetPdo->exec($indexSql);
-                        $this->logger->info("Created index: {$index['name']} on {$table}");
+                        $this->logger->info("Created index: {$index['name']} on {$targetTable}");
                     } else {
                         $this->logger->info("DRY RUN - Would create index: {$index['name']}");
                     }
                 } catch (\Exception $e) {
-                    $this->logger->warning("Failed to create index {$index['name']} on {$table}: " . $e->getMessage());
+                    $this->logger->warning("Failed to create index {$index['name']} on {$targetTable}: " . $e->getMessage());
                 }
             }
         }
@@ -449,14 +463,15 @@ class SchemaMigrator
         $successCount = 0;
         $failedCount = 0;
 
-        foreach ($schemaMapping as $table => $schema) {
+        foreach ($schemaMapping as $sourceTable => $schema) {
+            $targetTable = $schema['target_table'] ?? $sourceTable;
             foreach ($schema['foreign_keys'] as $fk) {
                 try {
                     // Validate foreign key data before creating constraint
                     if (!$this->dryRun) {
-                        $validationResult = $this->validateForeignKey($targetPdo, $table, $fk);
+                        $validationResult = $this->validateForeignKey($targetPdo, $targetTable, $fk);
                         if (!$validationResult['valid']) {
-                            $this->logger->warning("Skipping foreign key {$fk['name']} on {$table}: {$validationResult['message']}");
+                            $this->logger->warning("Skipping foreign key {$fk['name']} on {$targetTable}: {$validationResult['message']}");
                             if (!empty($validationResult['orphaned_count'])) {
                                 $this->logger->warning("  Found {$validationResult['orphaned_count']} orphaned row(s)");
                                 if (!empty($validationResult['sample_values'])) {
@@ -469,17 +484,17 @@ class SchemaMigrator
                         }
                     }
 
-                    $fkSql = $this->generateForeignKeyStatement($table, $fk);
-                    
+                    $fkSql = $this->generateForeignKeyStatement($targetTable, $fk);
+
                     if (!$this->dryRun) {
                         $targetPdo->exec($fkSql);
-                        $this->logger->info("Created foreign key: {$fk['name']} on {$table}");
+                        $this->logger->info("Created foreign key: {$fk['name']} on {$targetTable}");
                         $successCount++;
                     } else {
                         $this->logger->info("DRY RUN - Would create foreign key: {$fk['name']}");
                     }
                 } catch (\Exception $e) {
-                    $this->logger->warning("Failed to create foreign key {$fk['name']} on {$table}: " . $e->getMessage());
+                    $this->logger->warning("Failed to create foreign key {$fk['name']} on {$targetTable}: " . $e->getMessage());
                     $failedCount++;
                 }
             }
@@ -496,7 +511,8 @@ class SchemaMigrator
     private function validateForeignKey(PDO $pdo, string $table, array $fk): array
     {
         $tableName = $this->quoteIdentifier($table);
-        $foreignTableName = $this->quoteIdentifier($fk['foreign_table']);
+        $foreignTargetTable = $this->targetTableName($fk['foreign_table']);
+        $foreignTableName = $this->quoteIdentifier($foreignTargetTable);
         
         // Build column lists
         $columns = array_map([$this, 'quoteIdentifier'], $fk['columns']);
@@ -509,11 +525,11 @@ class SchemaMigrator
         $checkTableSql = "SELECT COUNT(*) FROM information_schema.tables 
                          WHERE table_schema = DATABASE() AND table_name = ?";
         $stmt = $pdo->prepare($checkTableSql);
-        $stmt->execute([$fk['foreign_table']]);
+        $stmt->execute([$foreignTargetTable]);
         if ($stmt->fetchColumn() == 0) {
             return [
                 'valid' => false,
-                'message' => "Referenced table '{$fk['foreign_table']}' does not exist",
+                'message' => "Referenced table '{$foreignTargetTable}' does not exist",
                 'orphaned_count' => 0,
                 'sample_values' => []
             ];
@@ -630,7 +646,7 @@ class SchemaMigrator
         $columns = array_map([$this, 'quoteIdentifier'], $fk['columns']);
         $foreignColumns = array_map([$this, 'quoteIdentifier'], $fk['foreign_columns']);
         $tableName = $this->quoteIdentifier($table);
-        $foreignTableName = $this->quoteIdentifier($fk['foreign_table']);
+        $foreignTableName = $this->quoteIdentifier($this->targetTableName($fk['foreign_table']));
         $constraintName = $this->quoteIdentifier($fk['name']);
 
         return sprintf(

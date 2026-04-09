@@ -9,6 +9,7 @@ use Migration\Database\ConnectionManager;
 use Migration\Logger\ProgressLogger;
 use Migration\Migrators\DataMigrator;
 use Migration\Migrators\SchemaMigrator;
+use Migration\Support\TableNaming;
 use Migration\Validators\DataValidator;
 use PDO;
 
@@ -25,8 +26,9 @@ class MigrateCommand
     private ?string $dateColumn;
     private ?string $skipTables;
     private ?string $includeTables;
+    private bool $lowercaseTableNames;
 
-    public function __construct(array $config, bool $dryRun = false, bool $skipIndexes = false, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null, ?string $skipTables = null, ?string $includeTables = null)
+    public function __construct(array $config, bool $dryRun = false, bool $skipIndexes = false, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null, ?string $skipTables = null, ?string $includeTables = null, bool $lowercaseTableNames = false)
     {
         $this->config = $config;
         $this->dryRun = $dryRun;
@@ -36,6 +38,7 @@ class MigrateCommand
         $this->dateColumn = $dateColumn;
         $this->skipTables = $skipTables;
         $this->includeTables = $includeTables;
+        $this->lowercaseTableNames = $lowercaseTableNames;
 
         $this->connectionManager = new ConnectionManager([
             'source' => $config['source'],
@@ -59,6 +62,10 @@ class MigrateCommand
 
             if ($this->dryRun) {
                 $this->logger->warning('DRY RUN MODE - No changes will be made');
+            }
+
+            if ($this->lowercaseTableNames) {
+                $this->logger->info('MySQL table names will be lowercased (source names unchanged)');
             }
 
             // Test connections
@@ -92,7 +99,8 @@ class MigrateCommand
                     $this->connectionManager,
                     $this->typeConverter,
                     $this->logger,
-                    $this->dryRun
+                    $this->dryRun,
+                    $this->lowercaseTableNames
                 );
 
                 // Merge CLI included/excluded tables with config
@@ -120,7 +128,8 @@ class MigrateCommand
                         $this->connectionManager,
                         $this->typeConverter,
                         $this->logger,
-                        $this->dryRun
+                        $this->dryRun,
+                        $this->lowercaseTableNames
                     );
 
                     // Get tables from source
@@ -138,7 +147,8 @@ class MigrateCommand
                     $missingTables = [];
                     foreach ($tablesWithSchemas as $tableInfo) {
                         $table = $tableInfo['table'];
-                        if (!$this->tableExists($targetPdo, $table)) {
+                        $targetTable = TableNaming::toTarget($table, $this->lowercaseTableNames);
+                        if (!$this->tableExists($targetPdo, $targetTable)) {
                             $missingTables[] = $tableInfo;
                         }
                     }
@@ -161,10 +171,12 @@ class MigrateCommand
                                     continue;
                                 }
 
-                                $createStatement = $schemaMigrator->generateCreateTableStatement($table, $tableSchema);
+                                $targetTable = TableNaming::toTarget($table, $this->lowercaseTableNames);
+                                $createStatement = $schemaMigrator->generateCreateTableStatement($targetTable, $tableSchema);
 
                                 $schemaMapping[$table] = [
                                     'schema' => $schema,
+                                    'target_table' => $targetTable,
                                     'columns' => $tableSchema['columns'],
                                     'indexes' => $tableSchema['indexes'],
                                     'foreign_keys' => $tableSchema['foreign_keys'],
@@ -172,9 +184,11 @@ class MigrateCommand
 
                                 if (!$this->dryRun) {
                                     $targetPdo->exec($createStatement);
-                                    $this->logger->success("Created missing table: {$table}");
+                                    $this->logger->success($targetTable !== $table
+                                        ? "Created missing table: {$targetTable} (from {$table})"
+                                        : "Created missing table: {$table}");
                                 } else {
-                                    $this->logger->info("DRY RUN - Would create missing table: {$table}");
+                                    $this->logger->info("DRY RUN - Would create missing table: {$targetTable}" . ($targetTable !== $table ? " (from {$table})" : ''));
                                 }
                             } catch (\Exception $e) {
                                 $this->logger->error("Failed to create missing table {$schema}.{$table}: " . $e->getMessage());
@@ -235,7 +249,8 @@ class MigrateCommand
                         $this->connectionManager,
                         $this->typeConverter,
                         $this->logger,
-                        $this->dryRun
+                        $this->dryRun,
+                        $this->lowercaseTableNames
                     );
 
                     // Skip indexes if requested (via CLI flag or config)
@@ -258,7 +273,7 @@ class MigrateCommand
                 $tablesInclude = $this->getIncludedTables();
                 $tablesExclude = $this->getExcludedTables();
 
-                $validator = new DataValidator($this->connectionManager, $this->logger);
+                $validator = new DataValidator($this->connectionManager, $this->logger, $this->lowercaseTableNames);
                 $results = $validator->validateMigration(
                     $tablesInclude,
                     $tablesExclude
@@ -293,7 +308,7 @@ class MigrateCommand
     private function formatDuration(float $seconds): string
     {
         if (!is_finite($seconds) || $seconds <= 0) {
-            return '0s';
+            return '0h 0m 0s';
         }
 
         $total = (int) ceil($seconds);
@@ -302,13 +317,7 @@ class MigrateCommand
         $minutes = intdiv($total % 3600, 60);
         $secs = $total % 60;
 
-        if ($hours > 0) {
-            return sprintf('%dh %dm %ds', $hours, $minutes, $secs);
-        }
-        if ($minutes > 0) {
-            return sprintf('%dm %ds', $minutes, $secs);
-        }
-        return sprintf('%ds', $secs);
+        return sprintf('%dh %dm %ds', $hours, $minutes, $secs);
     }
 
     public static function parseArguments(array $argv): array
@@ -319,6 +328,7 @@ class MigrateCommand
             'dry-run' => false,
             'skip-indexes' => false,
             'find-missing' => false,
+            'lowercase-tables' => false,
             'after-date' => null,
             'before-date' => null,
             'date-column' => null,
@@ -341,6 +351,8 @@ class MigrateCommand
                 $options['skip-indexes'] = true;
             } elseif ($arg === '--find-missing') {
                 $options['find-missing'] = true;
+            } elseif ($arg === '--lowercase-tables') {
+                $options['lowercase-tables'] = true;
             } elseif ($arg === '--after-date' && isset($argv[$index + 1])) {
                 $options['after-date'] = $argv[$index + 1];
             } elseif ($arg === '--before-date' && isset($argv[$index + 1])) {
@@ -381,7 +393,7 @@ class MigrateCommand
             $mergedExclude = array_merge($tablesExclude, $this->getExcludedTables());
             $mergedExclude = array_values(array_unique(array_filter($mergedExclude)));
 
-            $validator = new DataValidator($this->connectionManager, $this->logger);
+            $validator = new DataValidator($this->connectionManager, $this->logger, $this->lowercaseTableNames);
             $results = $validator->findMissingRows(
                 $mergedInclude,
                 $mergedExclude,

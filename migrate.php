@@ -87,6 +87,7 @@ if (in_array('--help', $argv) || in_array('-h', $argv)) {
     echo "  --skip-indexes  Skip creating indexes (faster migration, create manually later)\n";
     echo "  --tables TABLES  Comma-separated list of tables to migrate (only these tables will be migrated)\n";
     echo "  --skip-tables TABLES  Comma-separated list of tables to skip during migration\n";
+    echo "  --lowercase-tables  Create/use MySQL table names in lowercase (see MIGRATION_LOWERCASE_TABLE_NAMES)\n";
     echo "  --find-missing  Find tables and rows that were not migrated\n";
     echo "  --after-date DATE  Only migrate rows where date column is on or after DATE (requires --date-column)\n";
     echo "  --before-date DATE Only migrate rows where date column is before DATE (requires --date-column)\n";
@@ -101,7 +102,7 @@ if (in_array('--help', $argv) || in_array('-h', $argv)) {
     echo "Environment Variables:\n";
     echo "  PG_HOST, PG_PORT, PG_DATABASE, PG_USERNAME, PG_PASSWORD\n";
     echo "  MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, MYSQL_USERNAME, MYSQL_PASSWORD\n";
-    echo "  MIGRATION_CHUNK_SIZE, MIGRATION_PARALLEL_WORKERS, etc.\n\n";
+    echo "  MIGRATION_CHUNK_SIZE, MIGRATION_PARALLEL_WORKERS, MIGRATION_LOWERCASE_TABLE_NAMES, etc.\n\n";
     exit(0);
 }
 
@@ -126,6 +127,8 @@ foreach ($requiredTarget as $key) {
 }
 
 try {
+    $lowercaseTableNames = ($options['lowercase-tables'] ?? false) || ($config['migration']['lowercase_table_names'] ?? false);
+
     $command = new MigrateCommand(
         $config, 
         $options['dry-run'], 
@@ -134,7 +137,8 @@ try {
         $options['before-date'],
         $options['date-column'],
         $options['skip-tables'] ?? null,
-        $options['tables'] ?? null
+        $options['tables'] ?? null,
+        $lowercaseTableNames
     );
     
     if ($options['find-missing']) {

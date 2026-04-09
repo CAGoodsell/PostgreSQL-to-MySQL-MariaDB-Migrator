@@ -6,17 +6,25 @@ namespace Migration\Validators;
 
 use Migration\Database\ConnectionManager;
 use Migration\Logger\ProgressLogger;
+use Migration\Support\TableNaming;
 use PDO;
 
 class DataValidator
 {
     private ConnectionManager $connectionManager;
     private ProgressLogger $logger;
+    private bool $lowercaseTableNames;
 
-    public function __construct(ConnectionManager $connectionManager, ProgressLogger $logger)
+    public function __construct(ConnectionManager $connectionManager, ProgressLogger $logger, bool $lowercaseTableNames = false)
     {
         $this->connectionManager = $connectionManager;
         $this->logger = $logger;
+        $this->lowercaseTableNames = $lowercaseTableNames;
+    }
+
+    private function targetMysqlTable(string $sourceTable): string
+    {
+        return TableNaming::toTarget($sourceTable, $this->lowercaseTableNames);
     }
 
     public function validateMigration(array $tablesInclude = [], array $tablesExclude = []): array
@@ -68,7 +76,7 @@ class DataValidator
     {
         // Get row counts
         $sourceRows = $this->getRowCount($sourcePdo, $table);
-        $targetRows = $this->getRowCount($targetPdo, $table);
+        $targetRows = $this->getRowCount($targetPdo, $this->targetMysqlTable($table));
         $rowCountMatch = $sourceRows === $targetRows;
 
         // Sample data validation (first 100 rows)
@@ -107,7 +115,7 @@ class DataValidator
         $sourceColumnsList = implode(', ', $sourceQuotedColumns);
         $targetColumnsList = implode(', ', $targetQuotedColumns);
         $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table);
-        $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
+        $targetTableRef = $this->quoteTableForPdo($targetPdo, $this->targetMysqlTable($table));
 
         // Fetch sample from both databases
         $sampleSize = min(100, $this->getRowCount($sourcePdo, $table));
@@ -254,7 +262,7 @@ class DataValidator
             
             try {
                 $sourceRows = $this->getRowCount($sourcePdo, $table, $sourceSchema);
-                $targetRows = $this->getRowCount($targetPdo, $table);
+                $targetRows = $this->getRowCount($targetPdo, $this->targetMysqlTable($table));
                 
                 if ($sourceRows === $targetRows) {
                     $this->logger->info("Table {$table}: Row counts match, skipping detailed check");
@@ -312,7 +320,7 @@ class DataValidator
             $sourcePk = $this->quoteIdentifierForPdo($sourcePdo, $pkColumn);
             $targetPk = $this->quoteIdentifierForPdo($targetPdo, $pkColumn);
             $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table, $sourceSchema);
-            $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
+            $targetTableRef = $this->quoteTableForPdo($targetPdo, $this->targetMysqlTable($table));
 
             // Pull a sample of PKs from source, then check which ones exist in target.
             $sourceLimit = max(1, (int) $limit) * 2;
@@ -368,7 +376,7 @@ class DataValidator
         $columnsList = implode(', ', $sourceQuotedColumns);
         
         $sourceTableRef = $this->quoteTableForPdo($sourcePdo, $table, $sourceSchema);
-        $targetTableRef = $this->quoteTableForPdo($targetPdo, $table);
+        $targetTableRef = $this->quoteTableForPdo($targetPdo, $this->targetMysqlTable($table));
         
         // Get sample rows from source
         $sourceLimit = $limit * 2;

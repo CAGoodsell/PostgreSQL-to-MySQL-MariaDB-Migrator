@@ -7,6 +7,7 @@ namespace Migration\Migrators;
 use Migration\Converters\TypeConverter;
 use Migration\Database\ConnectionManager;
 use Migration\Logger\ProgressLogger;
+use Migration\Support\TableNaming;
 use PDO;
 use PDOException;
 
@@ -33,6 +34,18 @@ class DataMigrator
         $this->config = $config;
         $this->dryRun = $dryRun;
         $this->schemaMapping = $schemaMapping;
+    }
+
+    private function resolveTargetTable(string $sourceTable): string
+    {
+        $meta = $this->schemaMapping[$sourceTable] ?? null;
+        if (is_array($meta) && isset($meta['target_table'])) {
+            return $meta['target_table'];
+        }
+
+        $lower = $this->config['lowercase_table_names'] ?? false;
+
+        return TableNaming::toTarget($sourceTable, (bool) $lower);
     }
 
     public function migrateData(array $tablesInclude = [], array $tablesExclude = [], bool $resume = false, ?string $sourceSchema = null, ?string $afterDate = null, ?string $beforeDate = null, ?string $dateColumn = null): void
@@ -197,7 +210,7 @@ class DataMigrator
             }
 
             if (!$this->dryRun) {
-                $this->insertChunk($targetPdo, $table, $columns, $chunkData);
+                $this->insertChunk($targetPdo, $this->resolveTargetTable($table), $columns, $chunkData);
             }
 
             $rowsInChunk = count($chunkData);

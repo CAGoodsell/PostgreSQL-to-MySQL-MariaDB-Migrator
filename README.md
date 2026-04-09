@@ -211,6 +211,7 @@ MYSQL_SSH_REMOTE_PORT=3306
 - `MIGRATION_PARALLEL_WORKERS` - Number of parallel workers (default: 4)
 - `MIGRATION_CHECKPOINT_INTERVAL` - Checkpoint frequency in chunks (default: 100)
 - `MIGRATION_SKIP_INDEXES` - Skip index creation (true/false, default: false)
+- `MIGRATION_LOWERCASE_TABLE_NAMES` - When `true`, MySQL/MariaDB tables are created and referenced using lowercased PostgreSQL table names (`strtolower` on the identifier; default: false). Source PostgreSQL names and queries are unchanged. If you set this in `.env`, you can omit `--lowercase-tables` on the CLI; the CLI flag and this variable are combined with logical OR (either one enables the behavior).
 
 **Date Filtering (CLI-only options):**
 Date filtering is currently only available via CLI options (`--after-date`, `--before-date`, `--date-column`). These cannot be set via environment variables in the current version.
@@ -220,11 +221,13 @@ Date filtering is currently only available via CLI options (`--after-date`, `--b
 **Note:** You can also use CLI options to specify tables without modifying your `.env` file:
 - `--tables TABLES` - Specify which tables to migrate (merged with `MIGRATION_TABLES_INCLUDE`). Works with `--full`, `--schema-only`, and `--data-only` modes.
 - `--skip-tables TABLES` - Specify which tables to skip (merged with `MIGRATION_TABLES_EXCLUDE`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+- `--lowercase-tables` - Lowercase MySQL/MariaDB table names when creating schema, migrating data, validating, and when using `--find-missing` (equivalent to `MIGRATION_LOWERCASE_TABLE_NAMES=true`).
 
 **Behavior:**
 - If both `--tables` and `MIGRATION_TABLES_INCLUDE` are specified, only tables that appear in both lists will be migrated (intersection).
 - If both `--tables` and `--skip-tables` are specified, excluded tables take precedence (tables in `--skip-tables` will not be migrated even if they're in `--tables`).
 - In `--data-only` mode, table filtering applies to both table discovery (for auto-creating missing tables) and data migration.
+- **Lowercase table names**: Use the same setting (env and/or `--lowercase-tables`) for every phase—schema, data-only reruns, validation, and `--find-missing`—so target table names stay consistent. If two PostgreSQL tables differ only by case, lowercasing them can produce a single conflicting name on MySQL; resolve that on the source or exclude tables before migrating.
 
 ### Configuration File
 
@@ -304,6 +307,9 @@ php migrate.php --data-only --tables 'transactions' --after-date '2024-01-01' --
 
 # Find missing rows (rows in source but not in target)
 php migrate.php --find-missing
+
+# Lowercase MySQL table names (or set MIGRATION_LOWERCASE_TABLE_NAMES=true in .env)
+php migrate.php --full --lowercase-tables
 ```
 
 ### Command Options
@@ -316,6 +322,7 @@ php migrate.php --find-missing
 - `--skip-indexes` - Skip creating indexes (faster migration, create manually later)
 - `--tables TABLES` - Comma-separated list of tables to migrate (only these tables will be migrated, e.g., `'users,orders,products'`). Works with `--full`, `--schema-only`, and `--data-only` modes.
 - `--skip-tables TABLES` - Comma-separated list of tables to skip during migration (e.g., `'logs,audit_trail'`). Works with `--full`, `--schema-only`, and `--data-only` modes.
+- `--lowercase-tables` - Use lowercase table names on MySQL/MariaDB for schema, data, foreign keys, validation, and `--find-missing` (see `MIGRATION_LOWERCASE_TABLE_NAMES`)
 - `--find-missing` - Find tables and rows that were not migrated
 - `--after-date DATE` - Only migrate rows where date column is on or after DATE (includes DATE, requires `--date-column`)
 - `--before-date DATE` - Only migrate rows where date column is before DATE (excludes DATE, requires `--date-column`)
@@ -683,6 +690,10 @@ php migrate.php --data-only --tables 'transactions' --after-date '2024-01-01' --
 # Use both include and exclude (exclude takes precedence)
 php migrate.php --full --tables 'users,orders,products,logs' --skip-tables 'logs'
 # Result: Only 'users', 'orders', and 'products' will be migrated (logs is excluded)
+
+# Lowercase target table names (pairs with MIGRATION_LOWERCASE_TABLE_NAMES in .env)
+php migrate.php --full --lowercase-tables
+php migrate.php --data-only --lowercase-tables --tables 'users,orders'
 ```
 
 ### Incremental Migration (Date Filtering)
@@ -703,7 +714,7 @@ php migrate.php --data-only --after-date '2024-01-01' --before-date '2024-12-31'
 # 5. Combine with table filtering for specific tables
 php migrate.php --data-only --tables 'transactions,orders' --after-date '2024-01-01' --date-column 'created_at'
 
-# 6. Check for any missing rows
+# 6. Check for any missing rows (add --lowercase-tables if that migration used lowercased names)
 php migrate.php --find-missing
 ```
 
@@ -714,6 +725,9 @@ After migration, you can identify any rows that didn't migrate successfully:
 ```bash
 # Find all missing rows
 php migrate.php --find-missing
+
+# If the target was migrated with lowercased table names, use the same option:
+php migrate.php --find-missing --lowercase-tables
 
 # This will show:
 # - Tables with row count mismatches
