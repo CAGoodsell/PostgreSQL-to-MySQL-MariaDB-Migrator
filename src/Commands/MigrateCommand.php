@@ -204,11 +204,14 @@ class MigrateCommand
                     }
                 }
 
+                // Merge CLI/env lowercase flag so DataMigrator matches SchemaMigrator (config file alone omits --lowercase-tables)
                 $dataMigrator = new DataMigrator(
                     $this->connectionManager,
                     $this->typeConverter,
                     $this->logger,
-                    $this->config['migration'],
+                    array_merge($this->config['migration'], [
+                        'lowercase_table_names' => $this->lowercaseTableNames,
+                    ]),
                     $schemaMapping,
                     $this->dryRun
                 );
