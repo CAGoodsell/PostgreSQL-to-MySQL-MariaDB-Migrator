@@ -137,6 +137,10 @@ class SshTunnelManager
             '-f', // Background
             '-o', 'StrictHostKeyChecking=no', // Don't prompt for host key verification
             '-o', 'LogLevel=ERROR', // Reduce log output
+            // Keep tunnels alive during long migrations (idle DB gaps, slow chunks)
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3',
+            '-o', 'TCPKeepAlive=yes',
             '-L', "{$localPort}:{$remoteHost}:{$remotePort}", // Local port forwarding
             '-p', (string)$sshPort,
         ];
