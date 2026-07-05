@@ -145,6 +145,10 @@ class ConnectionManager
 
             if ($driver === 'mysql') {
                 $pdo->exec("SET NAMES {$charset}");
+                // Long migrations can idle on source reads; keep the session alive
+                $pdo->exec('SET SESSION wait_timeout = 86400');
+                $pdo->exec('SET SESSION net_read_timeout = 600');
+                $pdo->exec('SET SESSION net_write_timeout = 600');
             }
 
             return $pdo;

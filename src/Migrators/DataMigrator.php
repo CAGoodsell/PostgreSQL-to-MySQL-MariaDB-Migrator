@@ -158,9 +158,6 @@ class DataMigrator
         $checkpoint = null;
         if ($resume) {
             $checkpoint = $this->logger->loadCheckpoint($table);
-            if ($checkpoint) {
-                $this->logger->info("Resuming from checkpoint: offset={$checkpoint['last_offset']}");
-            }
         }
 
         $totalRows = $tableInfo['row_count'];
@@ -181,14 +178,63 @@ class DataMigrator
         $availableMemoryMB = round(($memoryLimitBytes * 0.2) / 1024 / 1024, 0);
         $this->logger->info("Table {$schema}.{$table}: {$totalRows} rows, chunk size: {$chunkSize} (memory limit: {$memoryLimitMB}MB, available: {$availableMemoryMB}MB)");
 
-        // Calculate starting offset
-        $startOffset = $checkpoint ? $checkpoint['last_offset'] : 0;
-        $processedRows = $startOffset;
-        $overallProcessedRows += (int) $startOffset;
-
         // Get primary key column for cursor-based pagination (more efficient than OFFSET)
-        $pkColumn = $this->getPrimaryKeyColumn($table);
+        $pkColumn = $this->getPrimaryKeyColumn($sourcePdo, $table, $schema);
         $useCursorPagination = $pkColumn !== null;
+
+        // Calculate starting position (cursor PK or row offset)
+        $startOffset = 0;
+        $processedRows = 0;
+
+        if ($checkpoint !== null) {
+            $processedRows = (int) ($checkpoint['processed_rows'] ?? $checkpoint['last_offset'] ?? 0);
+
+            if ($useCursorPagination && $pkColumn !== null) {
+                $checkpointPk = $checkpoint['last_pk_value'] ?? null;
+                $targetMaxPk = $this->getTargetMaxPrimaryKey(
+                    $targetPdo,
+                    $this->resolveTargetTable($table),
+                    $pkColumn
+                );
+
+                if ($checkpointPk !== null && $targetMaxPk !== null) {
+                    $startOffset = $this->maxComparable($checkpointPk, $targetMaxPk);
+                } elseif ($targetMaxPk !== null) {
+                    $startOffset = $targetMaxPk;
+                } elseif ($checkpointPk !== null) {
+                    $startOffset = $checkpointPk;
+                } else {
+                    $startOffset = 0;
+                }
+
+                $this->logger->info(
+                    "Resuming from checkpoint: processed_rows={$processedRows}, cursor after PK={$startOffset}"
+                    . ($targetMaxPk !== null ? " (target MAX({$pkColumn})={$targetMaxPk})" : '')
+                );
+            } else {
+                // Fallback: try target PK so resume can skip rows already inserted
+                $targetTable = $this->resolveTargetTable($table);
+                $targetPkColumn = $this->getTargetPrimaryKeyColumn($targetPdo, $targetTable);
+
+                if ($targetPkColumn !== null) {
+                    $pkColumn = $targetPkColumn;
+                    $useCursorPagination = true;
+                    $targetMaxPk = $this->getTargetMaxPrimaryKey($targetPdo, $targetTable, $targetPkColumn);
+                    $startOffset = $targetMaxPk ?? 0;
+
+                    $this->logger->info(
+                        "Resuming from checkpoint: processed_rows={$processedRows}, cursor after PK={$startOffset}"
+                        . ($targetMaxPk !== null ? " (target MAX({$targetPkColumn})={$targetMaxPk})" : '')
+                    );
+                } else {
+                    $startOffset = (int) ($checkpoint['last_offset'] ?? 0);
+                    $processedRows = $startOffset;
+                    $this->logger->info("Resuming from checkpoint: offset={$startOffset}");
+                }
+            }
+        }
+
+        $overallProcessedRows += $processedRows;
 
         while ($processedRows < $totalRows) {
             $chunkData = $this->fetchChunk(
@@ -254,11 +300,21 @@ class DataMigrator
 
             // Save checkpoint periodically
             if ($processedRows % ($chunkSize * $this->config['checkpoint_interval']) === 0) {
-                $this->logger->saveCheckpoint($table, [
-                    'last_offset' => $processedRows,
+                $checkpointData = [
+                    'processed_rows' => $processedRows,
+                    'last_offset' => $useCursorPagination && $lastPkValue !== null
+                        ? $lastPkValue
+                        : $processedRows,
                     'total_rows' => $totalRows,
                     'chunk_size' => $chunkSize,
-                ]);
+                ];
+
+                if ($useCursorPagination && $lastPkValue !== null && $pkColumn !== null) {
+                    $checkpointData['last_pk_value'] = $lastPkValue;
+                    $checkpointData['pk_column'] = $pkColumn;
+                }
+
+                $this->logger->saveCheckpoint($table, $checkpointData);
             }
 
             // Update offset for next iteration
@@ -460,24 +516,82 @@ class DataMigrator
         ];
     }
 
-    private function getPrimaryKeyColumn(string $table): ?string
+    private function getPrimaryKeyColumn(PDO $sourcePdo, string $table, string $schema): ?string
     {
-        if (!isset($this->schemaMapping[$table])) {
+        if (isset($this->schemaMapping[$table]['primary_key']['columns'][0])) {
+            return $this->schemaMapping[$table]['primary_key']['columns'][0];
+        }
+
+        try {
+            $escapedSchema = str_replace("'", "''", $schema);
+            $escapedTable = str_replace("'", "''", $table);
+            $sql = "
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE i.indisprimary = true
+                AND n.nspname = '{$escapedSchema}'
+                AND c.relname = '{$escapedTable}'
+                LIMIT 1
+            ";
+
+            $stmt = $sourcePdo->query($sql);
+            $pk = $stmt->fetchColumn();
+
+            return $pk !== false && $pk !== '' ? (string) $pk : null;
+        } catch (\Exception) {
             return null;
         }
+    }
 
-        $columns = $this->schemaMapping[$table]['columns'] ?? [];
-        foreach ($columns as $column) {
-            // Check if this column is part of primary key
-            // This is a simplified check - in real implementation, check against primary_key definition
-            if (isset($column['column_name'])) {
-                // For now, return first column as potential PK
-                // In production, should check actual PK definition
-                return $column['column_name'];
-            }
+    private function getTargetPrimaryKeyColumn(PDO $pdo, string $table): ?string
+    {
+        try {
+            $sql = "
+                SELECT column_name
+                FROM information_schema.key_column_usage
+                WHERE table_schema = DATABASE()
+                AND table_name = ?
+                AND constraint_name = 'PRIMARY'
+                ORDER BY ordinal_position
+                LIMIT 1
+            ";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$table]);
+            $pk = $stmt->fetchColumn();
+
+            return $pk !== false && $pk !== '' ? (string) $pk : null;
+        } catch (\Exception) {
+            return null;
+        }
+    }
+
+    /**
+     * Highest primary key already present in the target table (for resume after failure).
+     */
+    private function getTargetMaxPrimaryKey(PDO $pdo, string $table, string $pkColumn): mixed
+    {
+        try {
+            $tableName = $this->quoteIdentifier($table);
+            $colName = $this->quoteIdentifier($pkColumn);
+            $stmt = $pdo->query("SELECT MAX({$colName}) FROM {$tableName}");
+            $value = $stmt->fetchColumn();
+
+            return $value !== false && $value !== null ? $value : null;
+        } catch (\Exception) {
+            return null;
+        }
+    }
+
+    private function maxComparable(mixed $a, mixed $b): mixed
+    {
+        if (is_numeric($a) && is_numeric($b)) {
+            return (float) $a >= (float) $b ? $a : $b;
         }
 
-        return null;
+        return (string) $a >= (string) $b ? $a : $b;
     }
 
     private function determineChunkSize(int $sizeMb): int
